@@ -779,9 +779,13 @@ configure_vlans() {
 
 VLAN and bridge configuration completed successfully.
 
-The system will now reboot to apply network changes.
+The system will attempt to reboot and apply network changes.
 
-You will lose connectivity temporarily." 10 60
+You may have to go to the console and manually reboot if connectivity is lost. 
+
+If it is the OK button below will be non-responsive
+
+You will lose connectivity temporarily." 10 70
 
     # Clean up temp file
     rm -f "$TMP_FILE"
