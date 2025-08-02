@@ -602,7 +602,7 @@ remove_home_mapper() {
         return 0
     fi
 
-    dialog --title "⚠️ WARNING: Remove /home Volume" --yesno \
+    dialog --title "WARNING: Remove /home Volume" --yesno \
     "This will:\n
 - Unmount /home (currently $MOUNTPOINT_HOME)\n
 - Delete the LVM volume backing it\n
@@ -659,7 +659,7 @@ Continue only if you understand the risk and have a backup.\n\nDo you want to pr
     # 7. Clean up
     rm -rf "$BACKUP_DIR"
 
-    dialog --title "✅ Success" --msgbox \
+    dialog --title "Success" --msgbox \
     "The /home LVM volume was removed and the space has been merged into root.\n\nAll data was preserved." 10 60
 }
 # ========= SHOW INFO on VLANS  =========
