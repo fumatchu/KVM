@@ -590,8 +590,78 @@ check_and_enable_services() {
     "All required services have been verified:\n\n• libvirtd\n• cockpit.socket\n• fail2ban\n\nIf any were not running, they were started and enabled for boot." 12 60
 }
 
+# ========= RECLAIM SPACE FROM HOME MAPPER (LVM)  =========
+remove_home_mapper() {
+    TMP_FILE=$(mktemp)
+    MOUNTPOINT_HOME=$(df -h | awk '$6 == "/home" {print $1}')
+    LOGICAL_VOL_HOME=$(lvs --noheadings -o lv_name,vg_name | awk '$1 == "home" {print $1, $2}')
+    BACKUP_DIR="/root/home-backup"
 
+    if [[ "$MOUNTPOINT_HOME" != /dev/mapper/*home* ]]; then
+        dialog --title "Info" --msgbox "No separate /home LVM volume detected. Nothing to do." 6 50
+        return 0
+    fi
 
+    dialog --title "⚠️ WARNING: Remove /home Volume" --yesno \
+    "This will:\n
+- Unmount /home (currently $MOUNTPOINT_HOME)\n
+- Delete the LVM volume backing it\n
+- Extend the root LVM volume to use that space\n
+- Recreate /home under /\n
+- Restore all user data from /home\n\n
+Continue only if you understand the risk and have a backup.\n\nDo you want to proceed?" 15 60
+    if [ $? -ne 0 ]; then
+        dialog --msgbox "Operation cancelled by user." 6 40
+        return 1
+    fi
+
+    # 1. Backup data
+    dialog --infobox "Backing up contents of /home to $BACKUP_DIR..." 5 50
+    mkdir -p "$BACKUP_DIR"
+    rsync -a /home/ "$BACKUP_DIR/" || {
+        dialog --msgbox "Failed to backup /home. Aborting." 6 50
+        return 1
+    }
+
+    # 2. Unmount /home
+    dialog --infobox "Unmounting /home..." 5 40
+    umount /home || {
+        dialog --msgbox "Failed to unmount /home. Aborting." 6 50
+        return 1
+    }
+
+    # 3. Remove the logical volume
+    lvremove -y "$MOUNTPOINT_HOME" >> /dev/null 2>&1 || {
+        dialog --msgbox "Failed to remove logical volume $MOUNTPOINT_HOME" 6 50
+        return 1
+    }
+
+    # 4. Extend root volume
+    ROOT_LV="/dev/mapper/rl-root"
+    VG_NAME=$(lvs --noheadings -o vg_name "$ROOT_LV" | awk '{print $1}')
+    dialog --infobox "Extending root volume..." 5 40
+    lvextend -l +100%FREE "$ROOT_LV" >> /dev/null 2>&1 || {
+        dialog --msgbox "Failed to extend root volume." 6 50
+        return 1
+    }
+
+    # 5. Resize root filesystem
+    dialog --infobox "Resizing root filesystem..." 5 50
+    xfs_growfs / >> /dev/null 2>&1 || {
+        dialog --msgbox "Failed to resize root filesystem." 6 50
+        return 1
+    }
+
+    # 6. Create new /home and restore data
+    mkdir /home
+    rsync -a "$BACKUP_DIR/" /home/
+
+    # 7. Clean up
+    rm -rf "$BACKUP_DIR"
+
+    dialog --title "✅ Success" --msgbox \
+    "The /home LVM volume was removed and the space has been merged into root.\n\nAll data was preserved." 10 60
+}
 # ========= SHOW INFO on VLANS  =========
 show_vlan_warning() {
     dialog --title "VLAN Preparation Notice" --msgbox \
@@ -740,6 +810,7 @@ sleep 3
 update_and_install_packages
 vm_detection
 configure_fail2ban
+remove_home_mapper
 check_and_enable_services
 show_vlan_warning
 configure_vlans
