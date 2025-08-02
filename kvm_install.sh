@@ -505,7 +505,7 @@ log_ntp() {
 prompt_ntp_servers() {
     while true; do
         NTP_SERVERS=$(dialog --title "Chrony NTP Configuration" \
-            --inputbox "Enter up to 3 comma-separated NTP/AD server IPs or FQDNs:" 8 60 \
+            --inputbox "Enter up to 3 comma-separated NTP server IPs or FQDNs:" 8 60 \
             3>&1 1>&2 2>&3)
         exit_status=$?
         if [ $exit_status -eq 1 ] || [ $exit_status -eq 255 ]; then
