@@ -167,8 +167,7 @@ elif [[ "$IP_METHOD" == "auto" ]]; then
         [[ -n "$DNSSEARCH" ]] && break || dialog --msgbox "Search domain cannot be blank." 6 40
       done
 
-      dialog --title "Confirm Settings" --yesno "Apply these settings?\n\nInterface: $INTERFACE\nIP: $IPADDR\nGW: $GW\nFQDN: $HOSTNAME\nDNS: $DNSSER
-VER\nSearch: $DNSSEARCH" 12 60
+      dialog --title "Confirm Settings" --yesno "Apply these settings?\n\nInterface: $INTERFACE\nIP: $IPADDR\nGW: $GW\nFQDN: $HOSTNAME\nDNS: $DNSSERVER\nSearch: $DNSSEARCH" 12 60
 
       if [[ $? -eq 0 ]]; then
         nmcli con mod "$CONNECTION" ipv4.address "$IPADDR"
