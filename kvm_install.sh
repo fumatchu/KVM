@@ -647,8 +647,7 @@ configure_vlans() {
     fi
 
     # Prompt for native VLAN, showing current IP/gateway
-    dialog --inputbox "The system is currently using:\n\n  IP Address: $mgmt_ip\n  Gateway: $mgmt_gw\n\nPlease enter the native (untagged)
-VLAN ID for this management IP:" 12 60 2>$TMP_FILE
+    dialog --inputbox "The system is currently using:\n\n  IP Address: $mgmt_ip\n  Gateway: $mgmt_gw\n\nPlease enter the native (untagged) VLAN ID for this management IP:" 12 60 2>$TMP_FILE
     NATIVE_VLAN=$(<"$TMP_FILE")
 
     HOST_IP="$mgmt_ip"
@@ -690,13 +689,29 @@ VLAN ID for this management IP:" 12 60 2>$TMP_FILE
     nmcli con down "$chosen_iface"
     nmcli con up "$chosen_iface"
 
-    # Reload all connections
-    nmcli connection reload
+    # Remove auto-run block from .bash_profile
+    sed -i '/^## Run KVM installer/,/^fi$/d' /root/.bash_profile
 
-    dialog --msgbox "VLAN and bridge configuration completed.\n\nUse 'nmcli con show' to review all connections." 8 60
-    clear
+    rm -rf /root/KVM
+
+
+    # Prompt before reboot
+    dialog --title "Configuration Complete" --msgbox \
+"INSTALLATION COMPLETE!
+
+VLAN and bridge configuration completed successfully.
+
+The system will now reboot to apply network changes.
+
+You will lose connectivity temporarily." 10 60
+
+    # Clean up temp file
     rm -f "$TMP_FILE"
-    reboot
+
+    # Queue reboot in background so dialog message finishes
+    (sleep 2 && shutdown -r now "Rebooting to apply VLAN configuration") & disown
+
+    exit 0
 }
 
 
