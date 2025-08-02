@@ -9,7 +9,7 @@ RESET="\e[0m"
 USER=$(whoami)
 MAJOROS=$(cat /etc/redhat-release | grep -Eo "[0-9]" | sed '$d')
 clear
-echo -e "[${GREEN}SUCCESS${TEXTRESET}] Rocky KVM Builder ${YELLOW}Bootstrap${TEXTRESET}"
+echo -e "[${GREEN}SUCCESS${TEXTRESET}] Rocky ${CYAN}KVM${TEXTRESET} Builder ${YELLOW}Bootstrap${TEXTRESET}"
 # Checking for user permissions
 if [ "$USER" = "root" ]; then
   echo -e "[${GREEN}SUCCESS${TEXTRESET}] Running as root user."
