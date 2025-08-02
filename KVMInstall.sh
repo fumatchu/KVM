@@ -108,8 +108,8 @@ ${RESET}"
 
 echo " "
 echo -e "This Install will setup your machine for KVM and to be managed by Cockpit Machines plugin.
-The Installer is designed to have (1) interface that will be trunked to a network switch for management and VLAN creation
-for Virtual Machines"
+The Installer is designed to have (1) interface that will be trunked to a network switch.
+The Virtual Machines should be directly connected to the VLANS via cockpit for network connectivity"
 
 
 read -p "Press Enter to Continue"
