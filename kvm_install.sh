@@ -178,8 +178,7 @@ elif [[ "$IP_METHOD" == "auto" ]]; then
         hostnamectl set-hostname "$HOSTNAME"
 
 
-        dialog --clear --no-shadow --no-ok --title "Reboot Required" --aspect 9 --msgbox "Network stack set. The System will reboot. Reconnect at: $
-{IPADDR%%/*}" 5 95
+        dialog --clear --no-shadow --no-ok --title "Reboot Required" --aspect 9 --msgbox "Network stack set. The System will reboot. Reconnect at: ${IPADDR%%/*}" 5 95
         reboot
       fi
     done
