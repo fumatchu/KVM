@@ -579,6 +579,7 @@ STP (Spanning Tree Protocol) will be disabled on all interfaces created by this 
 Ensure STP is configured appropriately on your switch.
 
 Please verify your switch configuration before continuing.
+
 AFTER YOU SET THESE OPTIONS THE INTERFACES WILL RESET AND THE SERVER WILL REBOOT" 30 100
 }
 
