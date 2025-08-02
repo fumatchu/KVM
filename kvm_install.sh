@@ -818,7 +818,7 @@ sleep 3
 update_and_install_packages
 vm_detection
 configure_fail2ban
-#remove_home_mapper
+remove_home_mapper
 check_and_enable_services
 show_vlan_warning
 configure_vlans
