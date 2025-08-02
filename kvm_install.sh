@@ -659,6 +659,12 @@ Continue only if you understand the risk and have a backup.\n\nDo you want to pr
     # 7. Clean up
     rm -rf "$BACKUP_DIR"
 
+    # 8. Remove /home mount from /etc/fstab if it exists
+    if grep -q '[[:space:]]/home[[:space:]]' /etc/fstab; then
+    dialog --infobox "Cleaning up /etc/fstab entry for /home..." 5 50
+    sed -i.bak '/[[:space:]]\/home[[:space:]]/d' /etc/fstab
+fi
+
     dialog --title "Success" --msgbox \
     "The /home LVM volume was removed and the space has been merged into root.\n\nAll data was preserved." 10 60
 }
