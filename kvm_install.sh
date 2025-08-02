@@ -657,8 +657,7 @@ VLAN ID for this management IP:" 12 60 2>$TMP_FILE
     GATEWAY="$mgmt_gw"
 
     # Confirm all settings
-    dialog --title "Review Configuration" --yesno "Management IP: $HOST_IP\nGateway: $GATEWAY\nNative VLAN: $NATIVE_VLAN\nTagged VLANs: $VL
-AN_IDS\nTrunk Interface: $chosen_iface\n\nProceed with configuration?" 15 60
+    dialog --title "Review Configuration" --yesno "Management IP: $HOST_IP\nGateway: $GATEWAY\nNative VLAN: $NATIVE_VLAN\nTagged VLANs: $VLAN_IDS\nTrunk Interface: $chosen_iface\n\nProceed with configuration?" 15 60
     [ $? -ne 0 ] && { dialog --msgbox "Operation cancelled." 6 40; return 1; }
 
     # Create native bridge
