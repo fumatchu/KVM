@@ -334,8 +334,7 @@ update_and_install_packages() {
 
   dialog --title "Package Installation" --infobox "Installing Required Packages..." 5 50
   sleep 2
-  PACKAGE_LIST=("ntsysv" "iptraf" "fail2ban" "tuned" "qemu-kvm" "libvirt" "virt-install" "virt-manager" "virt-viewer" "cockpit" "cockpit-storaged" "
-cockpit-machines" "cockpit-files" "net-tools" "dmidecode" "ipcalc" "bind-utils"  "iotop" "zip" "yum-utils" "nano" "curl" "wget" "dnf-automatic")
+  PACKAGE_LIST=("ntsysv" "iptraf" "fail2ban" "tuned" "qemu-kvm" "libvirt" "virt-install" "virt-manager" "virt-viewer" "cockpit" "cockpit-storaged" "cockpit-machines" "cockpit-files" "net-tools" "dmidecode" "ipcalc" "bind-utils"  "iotop" "zip" "yum-utils" "nano" "curl" "wget" "dnf-automatic")
   TOTAL_PACKAGES=${#PACKAGE_LIST[@]}
 
   PIPE=$(mktemp -u)
