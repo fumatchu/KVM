@@ -112,7 +112,7 @@ The Installer is designed to have (1) interface that will be trunked to a networ
 for Virtual Machines"
 
 
-read -p "Press Any Key to Continue"
+read -p "Press Enter to Continue"
 PROFILE="/root/.bash_profile"
 BACKUP="/root/.bash_profile.bak.$(date +%Y%m%d%H%M%S)"
 INSTALLER="/root/KVM/kvm_install.sh"
