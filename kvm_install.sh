@@ -565,6 +565,36 @@ validate_time_sync() {
     return 0
 }
 
+# ========= START SERVICES  =========
+check_and_enable_services() {
+    SERVICES=("libvirtd" "cockpit.socket" "fail2ban")
+    for svc in "${SERVICES[@]}"; do
+        dialog --infobox "Checking and enabling '$svc'..." 5 50
+        sleep 1
+        if systemctl is-enabled --quiet "$svc"; then
+            if systemctl is-active --quiet "$svc"; then
+                dialog --infobox "$svc is already enabled and running." 5 50
+            else
+                systemctl start "$svc"
+                dialog --infobox "$svc was enabled but not running. Started now." 5 50
+            fi
+        else
+            systemctl enable --now "$svc"
+            if systemctl is-active --quiet "$svc"; then
+                dialog --infobox "$svc has been enabled and started successfully." 5 50
+            else
+                dialog --msgbox "Failed to start or enable $svc.\nPlease check systemctl status $svc manually." 7 60
+            fi
+        fi
+        sleep 2
+    done
+
+    dialog --title "Service Check Complete" --msgbox \
+    "All required services have been verified:\n\n• libvirtd\n• cockpit.socket\n• fail2ban\n\nIf any were not running, they were started and enabled for boot." 12 60
+}
+
+
+
 # ========= SHOW INFO on VLANS  =========
 show_vlan_warning() {
     dialog --title "VLAN Preparation Notice" --msgbox \
