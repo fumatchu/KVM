@@ -1,4 +1,4 @@
-# 🖥️ KVM & VLAN Setup Installer for Rocky Linux
+# KVM & VLAN Setup Installer for Rocky Linux
 
 This project provides a comprehensive, dialog-based Bash installer that automates the setup of a **Rocky Linux 9.x server** as a secure, VLAN-aware KVM virtualization host.
 
@@ -23,7 +23,7 @@ You get a fully-functional, secure KVM server ready for virtual machine deployme
 
 ---
 
-## 🧑‍💻 Usage Instructions
+## Usage Instructions
 
 ### 1. Install Rocky 9 or greater on your system. 
 You should only be using (1) physical interface that will be configured for trunking by your network swtich equipment, by deafult. 
@@ -34,7 +34,7 @@ The Script/Installer will take care of the rest.
 Open the EASY_INSTALL File and run the contents inside from the REPO itself 
 Or copy this line from here and run in terminal or SSH session:
 
-dnf -y install wget && cd /root &&  bash <(wget -qO- https://raw.githubusercontent.com/fumatchu/KVM/main/KVMInstall.sh)
+dnf -y install wget && cd /root && bash <(wget -qO- https://raw.githubusercontent.com/fumatchu/KVM/main/KVMInstall.sh)
 
 This will download and bootstrap the installer 
 
