@@ -36,7 +36,7 @@ Or copy this line from here and run in terminal or SSH session:
 
 dnf -y install wget && cd /root && bash <(wget -qO- https://raw.githubusercontent.com/fumatchu/KVM/main/KVMInstall.sh)
 
-This will download and bootstrap the installer 
+This will download and bootstrap the installer to the system
 
 ### 3. After you have run the installer, you need to manually reboot from the physical console if running over SSH (ctrl+alt+del, or login and type reboot). 
 Network changes will disconnect your active session at the end of the script if using SSH
