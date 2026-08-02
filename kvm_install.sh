@@ -366,6 +366,7 @@ install_packages() {
         "lsof"
         "ntsysv"
         "rsync"
+        "fail2ban"
         "tuned"
         "qemu-kvm"
         "libvirt"
@@ -623,6 +624,13 @@ Continue?" 20 78 || return 0
         die "Processes are using /home. Log users out and rerun. Original fstab restored."
     fi
 
+    # Let any in-flight writeback/allocation work on /home settle before we
+    # try to detach it - a filesystem that just absorbed a large rsync
+    # backup (and a recent package/kernel update) can briefly report busy
+    # purely from background kernel writeback, not an actual open handle.
+    sync
+    sleep 2
+
     # Do not let a failing umount kill the whole script here - under
     # set -e an unguarded failure would exit before the recovery check
     # below ever runs, silently skipping the fstab restore and leaving
@@ -633,18 +641,28 @@ Continue?" 20 78 || return 0
     if findmnt --target /home >/dev/null 2>&1; then
         # Capture what's actually holding /home open right now, since
         # whatever is busy may clear up by the time anyone looks manually.
+        # Every line here is individually guarded so a missing tool can
+        # never again abort the script before the recovery/die below runs.
         {
             echo "===== /home still busy after umount - diagnostic capture ====="
             echo "--- fuser -mv /home ---"
-            fuser -mv /home 2>&1
+            if command -v fuser >/dev/null 2>&1; then
+                fuser -mv /home 2>&1 || true
+            else
+                echo "(fuser not installed)"
+            fi
             echo "--- lsof +D /home ---"
-            lsof +D /home 2>&1
+            if command -v lsof >/dev/null 2>&1; then
+                lsof +D /home 2>&1 || true
+            else
+                echo "(lsof not installed)"
+            fi
             echo "--- logged in sessions (who) ---"
-            who 2>&1
+            who 2>&1 || true
             echo "--- recent kernel messages ---"
-            dmesg 2>&1 | tail -50
+            dmesg 2>&1 | tail -50 || true
             echo "================================================================"
-        } >>"$LOG_FILE" 2>&1
+        } >>"$LOG_FILE" 2>&1 || true
         cp -a "$fstab_backup" /etc/fstab
         systemctl daemon-reload
         die "/home remained mounted after umount. Diagnostic details (fuser/lsof/who/dmesg) were written to $LOG_FILE - check the '/home still busy' section there for the actual process holding it open. Original fstab restored; /home was left mounted and untouched."
