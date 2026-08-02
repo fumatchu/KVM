@@ -295,7 +295,7 @@ install_packages() {
         )
     )
 
-  # System update: run dnf's upgrade as a single background transaction,
+    # System update: run dnf's upgrade as a single background transaction,
     # then tail dnf's own output so the gauge shows the real package name
     # and a real X/Y count as dnf reports them, instead of a fabricated
     # phase message. A single transaction also avoids the ambiguity and
@@ -405,7 +405,7 @@ install_packages() {
 
     for PACKAGE in "${PACKAGE_LIST[@]}"; do
         COUNT=$((COUNT + 1))
-        
+
         PERCENT=$(( (COUNT * 100) / TOTAL_PACKAGES ))
 
         echo "$PERCENT" >&3
@@ -559,12 +559,22 @@ Continue?" 20 78 || return 0
     TMP_FILES+=("$fstab_tmp")
 
     mkdir -p "$backup"
-    cp -a /etc/fstab "$fstab_backup"
+
+    # Every recovery path below relies on this backup being valid, so treat
+    # its failure as fatal before anything about /home is touched.
+    if ! cp -a /etc/fstab "$fstab_backup"; then
+        die "Failed to back up /etc/fstab to $fstab_backup. Nothing was changed; aborting."
+    fi
+
     log "Backing up /home to $backup"
-    run rsync -aHAXS --numeric-ids /home/ "$backup/"
+    if ! run rsync -aHAXS --numeric-ids /home/ "$backup/"; then
+        die "Backup of /home to $backup failed. Nothing was changed; review $LOG_FILE."
+    fi
 
     # Verify the backup before touching the mount or LV.
-    run rsync -aHAXSn --delete --numeric-ids /home/ "$backup/"
+    if ! run rsync -aHAXSn --delete --numeric-ids /home/ "$backup/"; then
+        die "Backup verification of /home against $backup failed. Nothing was changed; review $LOG_FILE."
+    fi
 
     # Remove every active /home mount record by parsing fstab fields.
     # This works whether the source is UUID=, LABEL=, /dev/mapper/*, or /dev/*.
@@ -574,8 +584,10 @@ Continue?" 20 78 || return 0
         { print }
     ' /etc/fstab >"$fstab_tmp"
 
-    install -m 0644 "$fstab_tmp" /etc/fstab
-    systemctl daemon-reload
+    if ! install -m 0644 "$fstab_tmp" /etc/fstab; then
+        die "Failed to write the updated /etc/fstab from $fstab_tmp. Original fstab is still at $fstab_backup; /home was not touched."
+    fi
+    systemctl daemon-reload || true
 
     if findmnt --fstab --target /home >/dev/null 2>&1; then
         cp -a "$fstab_backup" /etc/fstab
@@ -597,38 +609,58 @@ Continue?" 20 78 || return 0
         die "Processes are using /home. Log users out and rerun. Original fstab restored."
     fi
 
-    run umount /home
+    # Do not let a failing umount kill the whole script here - under
+    # set -e an unguarded failure would exit before the recovery check
+    # below ever runs, silently skipping the fstab restore and leaving
+    # every later step (including VLAN configuration) unreached. Let the
+    # findmnt check below decide success or failure instead.
+    run umount /home || true
 
     if findmnt --target /home >/dev/null 2>&1; then
         cp -a "$fstab_backup" /etc/fstab
         systemctl daemon-reload
-        die "/home remained mounted after umount. Original fstab restored."
+        die "/home remained mounted after umount (likely busy - check for open files/processes with 'fuser -mv /home' or 'lsof +D /home'). Original fstab restored; /home was left mounted and untouched."
     fi
 
     home_uuid=$(blkid -s UUID -o value "$home_lv" 2>/dev/null || true)
     log "Removing /home LV $home_lv (UUID ${home_uuid:-unknown})."
-    run lvremove -y "$home_lv"
+
+    if ! run lvremove -y "$home_lv"; then
+        cp -a "$fstab_backup" /etc/fstab
+        systemctl daemon-reload
+        mkdir -p /home
+        mount /home >>"$LOG_FILE" 2>&1 || true
+        die "Failed to remove logical volume $home_lv. Original fstab restored and /home remount attempted. Review $LOG_FILE."
+    fi
 
     vg_free_before=$(vgs --noheadings --units b --nosuffix -o vg_free         "$(lvs --noheadings -o vg_name "$root_lv" | xargs)" 2>/dev/null |
         xargs || true)
     log "VG free bytes before extending root: ${vg_free_before:-unknown}"
 
-    run lvextend -l +100%FREE "$root_lv"
+    if ! run lvextend -l +100%FREE "$root_lv"; then
+        die "The /home logical volume was already removed, but extending $root_lv failed. Free space remains in the volume group. Your data is safely backed up at $backup - review $LOG_FILE and extend $root_lv manually."
+    fi
 
     case "$root_fs" in
         xfs)
-            run xfs_growfs /
+            if ! run xfs_growfs /; then
+                die "Root LV was extended, but xfs_growfs failed. Your data is backed up at $backup. Review $LOG_FILE and grow the filesystem manually."
+            fi
             ;;
         ext4)
-            run resize2fs "$root_lv"
+            if ! run resize2fs "$root_lv"; then
+                die "Root LV was extended, but resize2fs failed. Your data is backed up at $backup. Review $LOG_FILE and grow the filesystem manually."
+            fi
             ;;
         *)
-            die "Root LV was extended, but filesystem type '$root_fs' is unsupported. Grow it manually."
+            die "Root LV was extended, but filesystem type '$root_fs' is unsupported. Grow it manually. Your data is backed up at $backup."
             ;;
     esac
 
     mkdir -p /home
-    run rsync -aHAXS --numeric-ids "$backup/" /home/
+    if ! run rsync -aHAXS --numeric-ids "$backup/" /home/; then
+        die "Failed to restore /home data from $backup onto the new root filesystem. Your original data remains intact in the backup directory. Review $LOG_FILE and restore manually."
+    fi
     restorecon -RFv /home >>"$LOG_FILE" 2>&1 || true
 
     # Keep the backup until the next successful reboot; do not delete it automatically.
