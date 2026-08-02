@@ -351,7 +351,6 @@ install_packages() {
     PACKAGE_LIST=(
         "ntsysv"
         "rsync"
-        "iptraf"
         "fail2ban"
         "tuned"
         "qemu-kvm"
@@ -369,7 +368,7 @@ install_packages() {
         "bind-utils"
         "iotop"
         "zip"
-        "yum-utils"
+        "dnf-plugins-core"
         "nano"
         "curl"
         "wget"
