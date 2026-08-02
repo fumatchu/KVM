@@ -295,38 +295,58 @@ install_packages() {
         )
     )
 
-    # System update: run as a single dnf transaction. dnf gives no reliable
-    # per-package count ahead of time, so the gauge shows phase progress
-    # instead of a fabricated percentage from unstable check-update parsing.
-    local update_pipe update_gauge_pid update_rc dnf_pid progress
+  # System update: run dnf's upgrade as a single background transaction,
+    # then tail dnf's own output so the gauge shows the real package name
+    # and a real X/Y count as dnf reports them, instead of a fabricated
+    # phase message. A single transaction also avoids the ambiguity and
+    # repeated dependency resolution of updating packages one at a time.
+    local update_pipe update_gauge_pid update_rc dnf_pid line progress_log
+    local pkg_action pkg_name pkg_count pkg_total percent dnf_rc
 
     update_pipe=$(mktemp -u)
     mkfifo "$update_pipe"
 
     dialog --title "System Update" \
-        --gauge "Preparing the system update..." 10 70 0 <"$update_pipe" &
+        --gauge "Preparing the system update..." 10 74 0 <"$update_pipe" &
     update_gauge_pid=$!
 
     if (
         exec 3>"$update_pipe"
-        printf '5\nXXX\nRefreshing repository metadata...\nXXX\n' >&3
+        printf '0\nXXX\nRefreshing repository metadata...\nXXX\n' >&3
         dnf -q makecache >>"$LOG_FILE" 2>&1 || true
 
-        printf '15\nXXX\nResolving and installing available updates...\nXXX\n' >&3
+        printf '1\nXXX\nResolving the update transaction...\nXXX\n' >&3
 
-        dnf -y upgrade >>"$LOG_FILE" 2>&1 &
+        progress_log=$(mktemp)
+        : >"$progress_log"
+
+        dnf -y upgrade >"$progress_log" 2>&1 &
         dnf_pid=$!
-        progress=15
 
-        while kill -0 "$dnf_pid" 2>/dev/null; do
-            progress=$(( progress + 3 ))
-            (( progress > 92 )) && progress=20
-            printf '%s\nXXX\nSystem update is running. Details: %s\nXXX\n' \
-                "$progress" "$LOG_FILE" >&3
-            sleep 1
-        done
+        tail -n0 -F "$progress_log" --pid="$dnf_pid" 2>/dev/null | while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*(Upgrading|Installing|Reinstalling|Downgrading|Removing|Erasing|Obsoleting)[[:space:]]*:[[:space:]]+(.+[^[:space:]])[[:space:]]+([0-9]+)/([0-9]+)[[:space:]]*$ ]]; then
+                pkg_action="${BASH_REMATCH[1]}"
+                pkg_name="${BASH_REMATCH[2]}"
+                pkg_count="${BASH_REMATCH[3]}"
+                pkg_total="${BASH_REMATCH[4]}"
+                percent=$(( pkg_count * 100 / pkg_total ))
+                printf '%s\nXXX\n%s: %s (%s of %s)\nXXX\n' \
+                    "$percent" "$pkg_action" "$pkg_name" "$pkg_count" "$pkg_total" >&3
+            fi
+        done || true
 
         wait "$dnf_pid"
+        dnf_rc=$?
+
+        cat "$progress_log" >>"$LOG_FILE"
+        rm -f "$progress_log"
+
+        if (( dnf_rc == 0 )); then
+            printf '100\nXXX\nSystem update complete.\nXXX\n' >&3
+        else
+            printf '100\nXXX\nSystem update failed. See log for details.\nXXX\n' >&3
+        fi
+        exit "$dnf_rc"
     ); then
         update_rc=0
     else
