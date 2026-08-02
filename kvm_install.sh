@@ -632,9 +632,43 @@ Continue?" 20 78 || return 0
     fi
 
     # Let any in-flight writeback/allocation work on /home settle before we
-    # try to detach it - a filesystem that just absorbed a large rsync
-    # backup (and a recent package/kernel update) can briefly report busy
-    # purely from background kernel writeback, not an actual open handle.
+    # try to detach it. Backing up /home with rsync (backup pass, then the
+    # -n --delete verify pass) touches every single file in the tree twice,
+    # which on XFS spawns a large number of short-lived kernel worker
+    # threads to do delayed-allocation conversion (xfs-conv/<dev>) and
+    # per-inode writeback-cgroup reassignment (inode_switch_wbs). On a
+    # /home with many files this backlog can run into the thousands of
+    # queued work items and take well more than a couple of seconds to
+    # drain - during which umount legitimately returns "device busy" even
+    # though fuser/lsof show no real open handle, because the block device
+    # itself is still active underneath. Poll for that backlog to actually
+    # drain (or stop shrinking) instead of guessing a fixed delay.
+    local home_devnode home_devname wb_pattern wb_count wb_prev=-1 wb_stable=0 wb_waited=0
+
+    home_devnode=$(readlink -f "$home_lv" 2>/dev/null || true)
+    home_devname="${home_devnode##*/}"
+
+    if [[ -n "$home_devname" ]]; then
+        wb_pattern="inode_switch_wbs|xfs-conv/${home_devname}"
+        log "Waiting for XFS writeback/inode-switch backlog on $home_devname to settle before unmounting /home..."
+        while (( wb_waited < 180 )); do
+            wb_count=$(ps -eo comm= 2>/dev/null | grep -Ec -- "$wb_pattern" || true)
+            log "  ...$wb_count matching kernel worker threads still running (${wb_waited}s elapsed)."
+            (( wb_count == 0 )) && break
+            if (( wb_count == wb_prev )); then
+                (( wb_stable += 1 ))
+                # No further progress for three consecutive checks in a row -
+                # assume this is steady-state noise, not an active drain.
+                (( wb_stable >= 3 )) && break
+            else
+                wb_stable=0
+            fi
+            wb_prev=$wb_count
+            sleep 3
+            wb_waited=$(( wb_waited + 3 ))
+        done
+    fi
+
     sync
     sleep 2
 
@@ -643,7 +677,20 @@ Continue?" 20 78 || return 0
     # below ever runs, silently skipping the fstab restore and leaving
     # every later step (including VLAN configuration) unreached. Let the
     # findmnt check below decide success or failure instead.
-    run umount /home || true
+    #
+    # Even after the backlog wait above, retry a handful of times with a
+    # short pause instead of giving up on the very first EBUSY.
+    local umount_attempt umount_ok=0
+    for umount_attempt in 1 2 3 4 5; do
+        if run umount /home; then
+            umount_ok=1
+            break
+        fi
+        log "umount /home attempt $umount_attempt failed (likely transient); retrying after a short pause."
+        sync
+        sleep 3
+    done
+    (( umount_ok )) || log "umount /home did not succeed after $umount_attempt attempts."
 
     if findmnt --target /home >/dev/null 2>&1; then
         # Capture what's actually holding /home open right now, since
