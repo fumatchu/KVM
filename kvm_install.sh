@@ -295,54 +295,46 @@ install_packages() {
         )
     )
 
-    dialog --title "System Update" --infobox \
-        "Checking for updates. This may take a few moments..." 5 70
-    sleep 2
+    # System update: run as a single dnf transaction. dnf gives no reliable
+    # per-package count ahead of time, so the gauge shows phase progress
+    # instead of a fabricated percentage from unstable check-update parsing.
+    local update_pipe update_gauge_pid update_rc dnf_pid progress
 
-    dnf check-update -y &>/dev/null || true
+    update_pipe=$(mktemp -u)
+    mkfifo "$update_pipe"
 
-    TEMP_FILE=$(mktemp)
-    dnf check-update 2>/dev/null |
-        awk '{print $1}' |
-        grep -vE '^$|Obsoleting|Last' |
-        awk -F'.' '{print $1}' |
-        sort -u > "$TEMP_FILE" || true
+    dialog --title "System Update" \
+        --gauge "Preparing the system update..." 10 70 0 <"$update_pipe" &
+    update_gauge_pid=$!
 
-    PACKAGE_LIST=($(cat "$TEMP_FILE"))
-    TOTAL_PACKAGES=${#PACKAGE_LIST[@]}
+    (
+        exec 3>"$update_pipe"
+        printf '5\nXXX\nRefreshing repository metadata...\nXXX\n' >&3
+        dnf -q makecache >>"$LOG_FILE" 2>&1 || true
 
-    if [[ "$TOTAL_PACKAGES" -eq 0 ]]; then
-        dialog --title "System Update" --msgbox "No updates available!" 6 50
-        rm -f "$TEMP_FILE"
-    else
-        PIPE=$(mktemp -u)
-        mkfifo "$PIPE"
+        printf '15\nXXX\nResolving and installing available updates...\nXXX\n' >&3
 
-        dialog --title "System Update" \
-            --gauge "Installing updates..." 10 70 0 < "$PIPE" &
+        dnf -y upgrade >>"$LOG_FILE" 2>&1 &
+        dnf_pid=$!
+        progress=15
 
-        exec 3>"$PIPE"
-        COUNT=0
-
-        for PACKAGE in "${PACKAGE_LIST[@]}"; do
-            ((COUNT++))
-            PERCENT=$(( (COUNT * 100) / TOTAL_PACKAGES ))
-
-            echo "$PERCENT" >&3
-            echo "XXX" >&3
-            echo "Updating: $PACKAGE" >&3
-            echo "XXX" >&3
-
-            if ! dnf -y install "$PACKAGE" >>"$LOG_FILE" 2>&1; then
-                exec 3>&-
-                rm -f "$PIPE" "$TEMP_FILE"
-                die "Update failed while installing '$PACKAGE'. Review $LOG_FILE."
-            fi
+        while kill -0 "$dnf_pid" 2>/dev/null; do
+            progress=$(( progress + 3 ))
+            (( progress > 92 )) && progress=20
+            printf '%s\nXXX\nSystem update is running. Details: %s\nXXX\n' \
+                "$progress" "$LOG_FILE" >&3
+            sleep 1
         done
 
-        exec 3>&-
-        rm -f "$PIPE" "$TEMP_FILE"
-    fi
+        wait "$dnf_pid"
+        exit $?
+    )
+    update_rc=$?
+
+    wait "$update_gauge_pid" 2>/dev/null || true
+    rm -f "$update_pipe"
+
+    (( update_rc == 0 )) || die "System update failed. Review $LOG_FILE."
 
     dialog --title "Package Installation" --infobox \
         "Installing Required Packages..." 5 50
@@ -351,6 +343,7 @@ install_packages() {
     PACKAGE_LIST=(
         "ntsysv"
         "rsync"
+        "iptraf-ng"
         "fail2ban"
         "tuned"
         "qemu-kvm"
