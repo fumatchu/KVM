@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.3.0"
 readonly LOG_FILE="/var/log/kvm_builder.log"
 readonly NETWORK_LOG="/var/log/kvm_vlan_setup.log"
 
@@ -477,27 +477,49 @@ offer_home_reclaim() {
     home_source=$(findmnt -n -o SOURCE --target /home 2>/dev/null || true)
     [[ -n "$home_source" ]] || return 0
 
-    # Resolve UUID=/LABEL= sources to the real block device.
+    # Resolve UUID=/LABEL=/mapper aliases to the canonical block device.
     home_lv=$(findmnt -n -o SOURCE --evaluate --target /home 2>/dev/null || true)
     [[ -n "$home_lv" ]] || home_lv="$home_source"
+    home_lv=$(readlink -f "$home_lv" 2>/dev/null || printf '%s' "$home_lv")
 
-    # Only offer this operation for an LVM logical volume.
-    if ! lvs --noheadings -o lv_path 2>/dev/null |
-        awk '{$1=$1};1' | grep -Fxq "$home_lv"; then
-        log "/home is not on an LVM logical volume ($home_source); skipping reclaim."
+    # Determine whether the canonical /home device belongs to LVM.
+    local matched_home_lv=""
+    while IFS= read -r candidate; do
+        candidate=$(echo "$candidate" | xargs)
+        [[ -n "$candidate" ]] || continue
+        if [[ "$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")" == "$home_lv" ]]; then
+            matched_home_lv="$candidate"
+            break
+        fi
+    done < <(lvs --noheadings -o lv_path 2>/dev/null)
+
+    if [[ -z "$matched_home_lv" ]]; then
+        log "/home is not on an LVM logical volume ($home_source -> $home_lv); skipping reclaim."
         return 0
     fi
+    home_lv="$matched_home_lv"
 
     root_source=$(findmnt -n -o SOURCE --target /)
     root_lv=$(findmnt -n -o SOURCE --evaluate --target / 2>/dev/null || true)
     [[ -n "$root_lv" ]] || root_lv="$root_source"
+    root_lv=$(readlink -f "$root_lv" 2>/dev/null || printf '%s' "$root_lv")
     root_fs=$(findmnt -n -o FSTYPE --target /)
 
-    if ! lvs --noheadings -o lv_path 2>/dev/null |
-        awk '{$1=$1};1' | grep -Fxq "$root_lv"; then
-        log "Root filesystem is not on LVM ($root_source); skipping /home reclaim."
+    local matched_root_lv=""
+    while IFS= read -r candidate; do
+        candidate=$(echo "$candidate" | xargs)
+        [[ -n "$candidate" ]] || continue
+        if [[ "$(readlink -f "$candidate" 2>/dev/null || printf '%s' "$candidate")" == "$root_lv" ]]; then
+            matched_root_lv="$candidate"
+            break
+        fi
+    done < <(lvs --noheadings -o lv_path 2>/dev/null)
+
+    if [[ -z "$matched_root_lv" ]]; then
+        log "Root filesystem is not on LVM ($root_source -> $root_lv); skipping /home reclaim."
         return 0
     fi
+    root_lv="$matched_root_lv"
 
     if [[ "$home_lv" == "$root_lv" ]]; then
         log "/home and / are already on the same logical volume; nothing to reclaim."
