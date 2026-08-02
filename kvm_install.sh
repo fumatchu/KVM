@@ -320,7 +320,14 @@ install_packages() {
         progress_log=$(mktemp)
         : >"$progress_log"
 
-        dnf -y upgrade >"$progress_log" 2>&1 &
+        # dnf is a Python program: when its stdout isn't a real terminal
+        # (as here, redirected into progress_log), Python fully buffers
+        # stdout in ~8KB chunks instead of flushing per line. Without this,
+        # every "Upgrading: pkg N/Total" line sits in that buffer and only
+        # appears all at once when it fills or dnf exits - which looks like
+        # the gauge freezing, then "instantly" finishing all 100+ packages.
+        # PYTHONUNBUFFERED forces Python to flush stdout after every write.
+        PYTHONUNBUFFERED=1 dnf -y upgrade >"$progress_log" 2>&1 &
         dnf_pid=$!
 
         tail -n0 -F "$progress_log" --pid="$dnf_pid" 2>/dev/null | while IFS= read -r line; do
