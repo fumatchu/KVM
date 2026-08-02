@@ -404,7 +404,8 @@ install_packages() {
     COUNT=0
 
     for PACKAGE in "${PACKAGE_LIST[@]}"; do
-        ((COUNT++))
+        COUNT=$((COUNT + 1))
+        
         PERCENT=$(( (COUNT * 100) / TOTAL_PACKAGES ))
 
         echo "$PERCENT" >&3
