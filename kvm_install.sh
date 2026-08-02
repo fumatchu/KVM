@@ -503,6 +503,12 @@ offer_home_reclaim() {
 
     if [[ -z "$matched_home_lv" ]]; then
         log "/home is not on an LVM logical volume ($home_source -> $home_lv); skipping reclaim."
+        dialog --title "Home Reclaim Skipped" --msgbox \
+"/home is mounted from:
+  $home_source
+
+This is not an LVM logical volume, so the automatic /home reclaim
+feature does not apply here. No changes were made." 11 72
         return 0
     fi
     home_lv="$matched_home_lv"
@@ -525,12 +531,23 @@ offer_home_reclaim() {
 
     if [[ -z "$matched_root_lv" ]]; then
         log "Root filesystem is not on LVM ($root_source -> $root_lv); skipping /home reclaim."
+        dialog --title "Home Reclaim Skipped" --msgbox \
+"Root filesystem is mounted from:
+  $root_source
+
+This is not an LVM logical volume, so /home cannot be reclaimed into
+it automatically. No changes were made." 11 72
         return 0
     fi
     root_lv="$matched_root_lv"
 
     if [[ "$home_lv" == "$root_lv" ]]; then
         log "/home and / are already on the same logical volume; nothing to reclaim."
+        dialog --title "Home Reclaim Skipped" --msgbox \
+"/home and / already share the same logical volume:
+  $home_lv
+
+There is nothing separate to reclaim. No changes were made." 10 72
         return 0
     fi
 
@@ -617,9 +634,23 @@ Continue?" 20 78 || return 0
     run umount /home || true
 
     if findmnt --target /home >/dev/null 2>&1; then
+        # Capture what's actually holding /home open right now, since
+        # whatever is busy may clear up by the time anyone looks manually.
+        {
+            echo "===== /home still busy after umount - diagnostic capture ====="
+            echo "--- fuser -mv /home ---"
+            fuser -mv /home 2>&1
+            echo "--- lsof +D /home ---"
+            lsof +D /home 2>&1
+            echo "--- logged in sessions (who) ---"
+            who 2>&1
+            echo "--- recent kernel messages ---"
+            dmesg 2>&1 | tail -50
+            echo "================================================================"
+        } >>"$LOG_FILE" 2>&1
         cp -a "$fstab_backup" /etc/fstab
         systemctl daemon-reload
-        die "/home remained mounted after umount (likely busy - check for open files/processes with 'fuser -mv /home' or 'lsof +D /home'). Original fstab restored; /home was left mounted and untouched."
+        die "/home remained mounted after umount. Diagnostic details (fuser/lsof/who/dmesg) were written to $LOG_FILE - check the '/home still busy' section there for the actual process holding it open. Original fstab restored; /home was left mounted and untouched."
     fi
 
     home_uuid=$(blkid -s UUID -o value "$home_lv" 2>/dev/null || true)
