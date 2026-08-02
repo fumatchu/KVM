@@ -363,10 +363,9 @@ install_packages() {
     sleep 2
 
     PACKAGE_LIST=(
+        "lsof"
         "ntsysv"
         "rsync"
-        "iptraf-ng"
-        "fail2ban"
         "tuned"
         "qemu-kvm"
         "libvirt"
@@ -381,10 +380,8 @@ install_packages() {
         "dmidecode"
         "ipcalc"
         "bind-utils"
-        "iotop"
         "zip"
         "dnf-plugins-core"
-        "nano"
         "curl"
         "wget"
         "dnf-automatic"
