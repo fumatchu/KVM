@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly LOG_FILE="/var/log/kvm_builder.log"
 readonly NETWORK_LOG="/var/log/kvm_vlan_setup.log"
 
@@ -358,41 +358,152 @@ enable_services() {
 }
 
 offer_home_reclaim() {
-    local home_dev root_lv backup
-    home_dev=$(findmnt -n -o SOURCE /home 2>/dev/null || true)
+    local home_source home_lv root_source root_lv root_fs
+    local backup fstab_backup fstab_tmp timestamp vg_free_before
+    local home_uuid=""
 
-    [[ "$home_dev" == /dev/mapper/* ]] || return 0
+    home_source=$(findmnt -n -o SOURCE --target /home 2>/dev/null || true)
+    [[ -n "$home_source" ]] || return 0
+
+    # Resolve UUID=/LABEL= sources to the real block device.
+    home_lv=$(findmnt -n -o SOURCE --evaluate --target /home 2>/dev/null || true)
+    [[ -n "$home_lv" ]] || home_lv="$home_source"
+
+    # Only offer this operation for an LVM logical volume.
+    if ! lvs --noheadings -o lv_path 2>/dev/null |
+        awk '{$1=$1};1' | grep -Fxq "$home_lv"; then
+        log "/home is not on an LVM logical volume ($home_source); skipping reclaim."
+        return 0
+    fi
+
+    root_source=$(findmnt -n -o SOURCE --target /)
+    root_lv=$(findmnt -n -o SOURCE --evaluate --target / 2>/dev/null || true)
+    [[ -n "$root_lv" ]] || root_lv="$root_source"
+    root_fs=$(findmnt -n -o FSTYPE --target /)
+
+    if ! lvs --noheadings -o lv_path 2>/dev/null |
+        awk '{$1=$1};1' | grep -Fxq "$root_lv"; then
+        log "Root filesystem is not on LVM ($root_source); skipping /home reclaim."
+        return 0
+    fi
+
+    if [[ "$home_lv" == "$root_lv" ]]; then
+        log "/home and / are already on the same logical volume; nothing to reclaim."
+        return 0
+    fi
 
     dialog --title "Optional LVM Reclaim" --yesno \
-"/home is on a separate logical volume:
+"/home is mounted from a separate LVM logical volume:
 
-$home_dev
+  Source: $home_source
+  Device: $home_lv
+  Root:   $root_lv
 
-Would you like to remove that logical volume, extend the root filesystem,
-and restore /home as a normal directory?
+This operation will:
 
-Choose No unless you specifically want this behavior." 14 76 || return 0
+  1. Back up all /home data
+  2. Remove the /home entry from /etc/fstab
+  3. Unmount /home
+  4. Remove the /home logical volume
+  5. Extend the root logical volume
+  6. Restore /home as a directory on root
 
-    root_lv=$(findmnt -n -o SOURCE /)
-    backup="/root/home-backup-$(date +%Y%m%d-%H%M%S)"
+Continue?" 20 78 || return 0
+
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    backup="/root/home-backup-${timestamp}"
+    fstab_backup="/etc/fstab.pre-home-reclaim-${timestamp}"
+    fstab_tmp=$(mktemp)
+    TMP_FILES+=("$fstab_tmp")
 
     mkdir -p "$backup"
-    run rsync -aHAX /home/ "$backup/"
+    cp -a /etc/fstab "$fstab_backup"
+    log "Backing up /home to $backup"
+    run rsync -aHAXS --numeric-ids /home/ "$backup/"
+
+    # Verify the backup before touching the mount or LV.
+    run rsync -aHAXSn --delete --numeric-ids /home/ "$backup/"
+
+    # Remove every active /home mount record by parsing fstab fields.
+    # This works whether the source is UUID=, LABEL=, /dev/mapper/*, or /dev/*.
+    awk '
+        /^[[:space:]]*#/ || NF == 0 { print; next }
+        $2 == "/home" { next }
+        { print }
+    ' /etc/fstab >"$fstab_tmp"
+
+    install -m 0644 "$fstab_tmp" /etc/fstab
+    systemctl daemon-reload
+
+    if findmnt --fstab --target /home >/dev/null 2>&1; then
+        cp -a "$fstab_backup" /etc/fstab
+        systemctl daemon-reload
+        die "The /home entry could not be removed from /etc/fstab. Original fstab restored."
+    fi
+
+    # Refuse to continue when another mount exists beneath /home.
+    if findmnt -R -n -o TARGET /home | tail -n +2 | grep -q .; then
+        cp -a "$fstab_backup" /etc/fstab
+        systemctl daemon-reload
+        die "Nested mounts exist below /home. Original fstab restored; reclaim aborted."
+    fi
+
+    # Processes with their working directory or open files in /home can block unmount.
+    if command -v fuser >/dev/null 2>&1 && fuser -m /home >/dev/null 2>&1; then
+        cp -a "$fstab_backup" /etc/fstab
+        systemctl daemon-reload
+        die "Processes are using /home. Log users out and rerun. Original fstab restored."
+    fi
+
     run umount /home
-    run lvremove -y "$home_dev"
+
+    if findmnt --target /home >/dev/null 2>&1; then
+        cp -a "$fstab_backup" /etc/fstab
+        systemctl daemon-reload
+        die "/home remained mounted after umount. Original fstab restored."
+    fi
+
+    home_uuid=$(blkid -s UUID -o value "$home_lv" 2>/dev/null || true)
+    log "Removing /home LV $home_lv (UUID ${home_uuid:-unknown})."
+    run lvremove -y "$home_lv"
+
+    vg_free_before=$(vgs --noheadings --units b --nosuffix -o vg_free         "$(lvs --noheadings -o vg_name "$root_lv" | xargs)" 2>/dev/null |
+        xargs || true)
+    log "VG free bytes before extending root: ${vg_free_before:-unknown}"
+
     run lvextend -l +100%FREE "$root_lv"
 
-    case "$(findmnt -n -o FSTYPE /)" in
-        xfs) run xfs_growfs / ;;
-        ext4) run resize2fs "$root_lv" ;;
-        *) die "Unsupported root filesystem for automatic resize." ;;
+    case "$root_fs" in
+        xfs)
+            run xfs_growfs /
+            ;;
+        ext4)
+            run resize2fs "$root_lv"
+            ;;
+        *)
+            die "Root LV was extended, but filesystem type '$root_fs' is unsupported. Grow it manually."
+            ;;
     esac
 
-    sed -i.bak '/[[:space:]]\/home[[:space:]]/d' /etc/fstab
     mkdir -p /home
-    run rsync -aHAX "$backup/" /home/
-    rm -rf "$backup"
+    run rsync -aHAXS --numeric-ids "$backup/" /home/
     restorecon -RFv /home >>"$LOG_FILE" 2>&1 || true
+
+    # Keep the backup until the next successful reboot; do not delete it automatically.
+    cat >"/root/README-home-backup-${timestamp}.txt" <<EOF
+/home was moved onto the root filesystem by kvm_install.sh.
+
+Backup directory:
+  $backup
+
+Original fstab:
+  $fstab_backup
+
+After rebooting and confirming all user data is present, these backup files
+may be removed manually.
+EOF
+
+    log "/home reclaim completed. Backup retained at $backup."
 }
 
 profile_exists() {
