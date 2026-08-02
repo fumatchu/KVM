@@ -327,7 +327,14 @@ install_packages() {
         # appears all at once when it fills or dnf exits - which looks like
         # the gauge freezing, then "instantly" finishing all 100+ packages.
         # PYTHONUNBUFFERED forces Python to flush stdout after every write.
-        PYTHONUNBUFFERED=1 dnf -y upgrade >"$progress_log" 2>&1 &
+        # fwupd-efi is excluded: its post-install scriptlet touches UEFI
+        # NVRAM, and slow/buggy EFI variable writes on real hardware are a
+        # known cause of a multi-minute stall mid-transaction (confirmed on
+        # this hardware: the gauge froze at the exact same package,
+        # "fwupd-efi ... 70 of 133", on two separate runs). A KVM hypervisor
+        # host has no real need for firmware-update tooling, so skip it
+        # rather than chase a firmware quirk on this specific board.
+        PYTHONUNBUFFERED=1 dnf -y upgrade --exclude='fwupd*' >"$progress_log" 2>&1 &
         dnf_pid=$!
 
         tail -n0 -F "$progress_log" --pid="$dnf_pid" 2>/dev/null | while IFS= read -r line; do
@@ -337,6 +344,11 @@ install_packages() {
                 pkg_count="${BASH_REMATCH[3]}"
                 pkg_total="${BASH_REMATCH[4]}"
                 percent=$(( pkg_count * 100 / pkg_total ))
+                # Timestamp every package transition into the real log (not
+                # just the progress_log dump at the end) so any future stall
+                # is immediately visible as a wall-clock gap between lines,
+                # instead of having to reproduce it to find out where time went.
+                log "dnf: $pkg_action $pkg_name ($pkg_count/$pkg_total)"
                 printf '%s\nXXX\n%s: %s (%s of %s)\nXXX\n' \
                     "$percent" "$pkg_action" "$pkg_name" "$pkg_count" "$pkg_total" >&3
             fi
