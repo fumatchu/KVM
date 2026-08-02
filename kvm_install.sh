@@ -1,443 +1,342 @@
 #!/usr/bin/env bash
+#
+# Rocky Linux KVM Host Builder
+# Standalone replacement for fumatchu/KVM kvm_install.sh
+#
+# Key networking behavior:
+#   - Native/untagged management network is placed on br<NATIVE_VLAN>
+#   - Cockpit and SSH use the management IP on that native bridge
+#   - Tagged VLAN interfaces use explicit names such as enp86s0.10
+#   - Every tagged VLAN is attached directly to a matching bridge such as br10
+#   - Cockpit therefore displays br10, br18, br20, etc., not nm-bridge1
+#   - No orphan bridge-slave-vlanXX profiles are created
+#
+# Run only from a local console or with out-of-band access available.
+# The final network cutover will interrupt an SSH session.
+
+set -Eeuo pipefail
+
+readonly SCRIPT_VERSION="2.0.0"
+readonly LOG_FILE="/var/log/kvm_builder.log"
+readonly NETWORK_LOG="/var/log/kvm_vlan_setup.log"
+
 GREEN="\033[0;32m"
 RED="\033[0;31m"
 YELLOW="\033[1;33m"
-TEXTRESET="\033[0m"
-CYAN="\e[36m"
-RESET="\e[0m"
+CYAN="\033[0;36m"
+RESET="\033[0m"
 
-MAJOROS=$(source /etc/os-release 2>/dev/null && echo "${VERSION_ID%%.*}")
+TMP_FILES=()
 
-clear
-echo -e "[${GREEN}SUCCESS${TEXTRESET}] Rocky ${CYAN}KVM${TEXTRESET} Builder ${YELLOW}Installation${TEXTRESET}"
+cleanup() {
+    local file
+    for file in "${TMP_FILES[@]:-}"; do
+        [[ -n "$file" ]] && rm -f "$file"
+    done
+}
+trap cleanup EXIT
 
-# Checking for user permissions
-if (( EUID == 0 )); then
-  echo -e "[${GREEN}SUCCESS${TEXTRESET}] Running as root user."
-  sleep 2
-else
-  echo -e "[${RED}ERROR${TEXTRESET}] This program must be run as root."
-  echo "Exiting..."
-  exit 1
-fi
-
-# Validate version parse
-if ! [[ "$MAJOROS" =~ ^[0-9]+$ ]]; then
-  echo -e "[${RED}ERROR${TEXTRESET}] Unable to detect OS major version"
-  echo "Exiting..."
-  exit 1
-fi
-
-# Checking for version information
-if [ "$MAJOROS" -ge 9 ]; then
-  echo -e "[${GREEN}SUCCESS${TEXTRESET}] Detected compatible OS version: Rocky ${MAJOROS}.x"
-  sleep 2
-else
-  echo -e "[${RED}ERROR${TEXTRESET}] Sorry, but this installer only works on Rocky 9.x or greater"
-  echo -e "Please upgrade to ${GREEN}Rocky 9.x${TEXTRESET} or later"
-  echo "Exiting the installer..."
-  exit 1
-fi
-
-# ========= VALIDATION HELPERS =========
-validate_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$ ]]; }
-validate_ip()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-validate_fqdn() { [[ "$1" =~ ^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$ ]]; }
-
-is_host_ip() {
-  local cidr="$1"
-  local ip_part="${cidr%/*}"
-  local mask="${cidr#*/}"
-
-  IFS='.' read -r o1 o2 o3 o4 <<< "$ip_part"
-  ip_dec=$(( (o1 << 24) + (o2 << 16) + (o3 << 8) + o4 ))
-
-  netmask=$(( 0xFFFFFFFF << (32 - mask) & 0xFFFFFFFF ))
-  network=$(( ip_dec & netmask ))
-  broadcast=$(( network | ~netmask & 0xFFFFFFFF ))
-
-  [[ "$ip_dec" -eq "$network" || "$ip_dec" -eq "$broadcast" ]] && return 1 || return 0
+log() {
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE" >/dev/null
 }
 
-check_hostname_in_domain() {
-  local fqdn="$1"
-  local hostname="${fqdn%%.*}"
-  local domain="${fqdn#*.}"
-  [[ ! "$domain" =~ (^|\.)"$hostname"(\.|$) ]]
-}
-
-# ========= SYSTEM CHECKS =========
-check_root_and_os() {
-  if [[ "$EUID" -ne 0 ]]; then
-    dialog --aspect 9 --title "Permission Denied" --msgbox "This script must be run as root." 7 50
-    clear; exit 1
-  fi
-
-  if [[ -f /etc/redhat-release ]]; then
-    MAJOROS=$(grep -oP '\d+' /etc/redhat-release | head -1)
-  else
-    dialog --title "OS Check Failed" --msgbox "/etc/redhat-release not found. Cannot detect OS." 7 50
-    exit 1
-  fi
-
-  if [[ "$MAJOROS" -lt 9 ]]; then
-    dialog --title "Unsupported OS" --msgbox "This installer requires Rocky Linux 9.x or later." 7 50
-    exit 1
-  fi
-}
-
-# ========= SELINUX CHECK =========
-check_and_enable_selinux() {
-  local current_status=$(getenforce)
-
-  if [[ "$current_status" == "Enforcing" ]]; then
-    dialog --title "SELinux Status" --infobox "SELinux is already enabled and enforcing." 6 50
-    sleep 4
-  else
-    dialog --title "SELinux Disabled" --msgbox "SELinux is not enabled. Enabling SELinux now..." 6 50
-    sed -i 's/SELINUX=disabled/SELINUX=enforcing/' /etc/selinux/config
-    setenforce 1
-
-    if [[ "$(getenforce)" == "Enforcing" ]]; then
-      dialog --title "SELinux Enabled" --msgbox "SELinux has been successfully enabled and is now enforcing." 6 50
+die() {
+    local message="$1"
+    log "ERROR: $message"
+    if command -v dialog >/dev/null 2>&1; then
+        dialog --title "Error" --msgbox "$message\n\nLog: $LOG_FILE" 10 72
     else
-      dialog --title "SELinux Error" --msgbox "Failed to enable SELinux. Please check the configuration manually." 6 50
-      exit 1
+        printf 'ERROR: %s\n' "$message" >&2
     fi
-  fi
-}
-
-# ========= NETWORK DETECTION =========
-detect_active_interface() {
-  dialog --title "Interface Check" --infobox "Checking active network interface..." 5 50
-  sleep 3
-
-  # Attempt 1: Use nmcli to find connected Ethernet
-  INTERFACE=$(nmcli -t -f DEVICE,TYPE,STATE device | grep "ethernet:connected" | cut -d: -f1 | head -n1)
-
-  # Attempt 2: Fallback to any interface with an IP if nmcli fails
-  if [[ -z "$INTERFACE" ]]; then
-    INTERFACE=$(ip -o -4 addr show up | grep -v ' lo ' | awk '{print $2}' | head -n1)
-  fi
-
-  # Get the matching connection profile name
-  if [[ -n "$INTERFACE" ]]; then
-    CONNECTION=$(nmcli -t -f NAME,DEVICE connection show | grep ":$INTERFACE" | cut -d: -f1)
-  fi
-
-  # Log to /tmp in case of failure
-  echo "DEBUG: INTERFACE=$INTERFACE" >> /tmp/kvm_debug.log
-  echo "DEBUG: CONNECTION=$CONNECTION" >> /tmp/kvm_debug.log
-
-  if [[ -z "$INTERFACE" || -z "$CONNECTION" ]]; then
-    dialog --clear  --no-ok --title "Interface Error" --aspect 9 --msgbox "No active network interface with IP found. Check /tmp/kvm_debug.log for d
-etails." 5 70
     exit 1
-  fi
-
-  export INTERFACE CONNECTION
 }
 
-# ========= STATIC IP CONFIG =========
-prompt_static_ip_if_dhcp() {
-  IP_METHOD=$(nmcli -g ipv4.method connection show "$CONNECTION" | tr -d '' | xargs)
-
-  if [[ "$IP_METHOD" == "manual" ]]; then
-  dialog --clear --title "Static IP Detected" --infobox "Interface '$INTERFACE' is already using a static IP.\nNo changes needed." 6 70
-  sleep 3
-  return
-elif [[ "$IP_METHOD" == "auto" ]]; then
-    while true; do
-      while true; do
-        IPADDR=$(dialog --title "Static IP" --inputbox "Enter static IP in CIDR format (e.g., 192.168.1.100/24):" 8 60 3>&1 1>&2 2>&3)
-        validate_cidr "$IPADDR" && break || dialog --msgbox "Invalid CIDR format. Try again." 6 40
-      done
-
-      while true; do
-        GW=$(dialog --title "Gateway" --inputbox "Enter default gateway:" 8 60 3>&1 1>&2 2>&3)
-        validate_ip "$GW" && break || dialog --msgbox "Invalid IP address. Try again." 6 40
-      done
-
-      while true; do
-        DNSSERVER=$(dialog --title "DNS Server" --inputbox "Enter Upstream DNS server IP:" 8 60 3>&1 1>&2 2>&3)
-        validate_ip "$DNSSERVER" && break || dialog --msgbox "Invalid IP address. Try again." 6 40
-      done
-
-      while true; do
-        HOSTNAME=$(dialog --title "FQDN" --inputbox "Enter FQDN (e.g., host.domain.com):" 8 60 3>&1 1>&2 2>&3)
-        if validate_fqdn "$HOSTNAME" && check_hostname_in_domain "$HOSTNAME"; then break
-        else dialog --msgbox "Invalid FQDN or hostname repeated in domain. Try again." 7 60
-        fi
-      done
-
-      while true; do
-        DNSSEARCH=$(dialog --title "DNS Search" --inputbox "Enter domain search suffix (e.g., localdomain):" 8 60 3>&1 1>&2 2>&3)
-        [[ -n "$DNSSEARCH" ]] && break || dialog --msgbox "Search domain cannot be blank." 6 40
-      done
-
-      dialog --title "Confirm Settings" --yesno "Apply these settings?\n\nInterface: $INTERFACE\nIP: $IPADDR\nGW: $GW\nFQDN: $HOSTNAME\nDNS: $DNSSERVER\nSearch: $DNSSEARCH" 12 60
-
-      if [[ $? -eq 0 ]]; then
-        nmcli con mod "$CONNECTION" ipv4.address "$IPADDR"
-        nmcli con mod "$CONNECTION" ipv4.gateway "$GW"
-        nmcli con mod "$CONNECTION" ipv4.method manual
-        nmcli con mod "$CONNECTION" ipv4.dns "$DNSSERVER"
-        nmcli con mod "$CONNECTION" ipv4.dns-search "$DNSSEARCH"
-        hostnamectl set-hostname "$HOSTNAME"
-
-
-        dialog --clear --no-shadow --no-ok --title "Reboot Required" --aspect 9 --msgbox "Network stack set. The System will reboot. Reconnect at: ${IPADDR%%/*}" 5 95
-        reboot
-      fi
-    done
-  fi
+run() {
+    log "RUN: $*"
+    "$@" >>"$LOG_FILE" 2>&1
 }
 
-# ========= UI SCREENS =========
-show_welcome_screen() {
-  clear
-  echo -e "${GREEN}
-                               .*((((((((((((((((*
-                         .(((((((((((((((((((((((((((/
-                      ,((((((((((((((((((((((((((((((((((.
-                    (((((((((((((((((((((((((((((((((((((((/
-                  (((((((((((((((((((((((((((((((((((((((((((/
-                .(((((((((((((((((((((((((((((((((((((((((((((
-               ,((((((((((((((((((((((((((((((((((((((((((((((((.
-               ((((((((((((((((((((((((((((((/   ,(((((((((((((((
-              /((((((((((((((((((((((((((((.        /((((((((((((*
-              ((((((((((((((((((((((((((/              ((((((((((
-              ((((((((((((((((((((((((                   *((((((/
-              /((((((((((((((((((((*                        (((((*
-               ((((((((((((((((((             (((*            ,((
-               .((((((((((((((.            /(((((((
-                 ((((((((((/             (((((((((((((/
-                  *((((((.            /((((((((((((((((((.
-                    *(*)            ,(((((((((((((((((((((((,
-                                 (((((((((((((((((((((((/
-                              /((((((((((((((((((((((.
-                                ,((((((((((((((,
-${RESET}"
-  echo -e "                         ${GREEN}Rocky Linux${RESET} ${CYAN}KVM${RESET} ${YELLOW}Builder${RESET}"
-
-  sleep 2
+require_root() {
+    (( EUID == 0 )) || die "This installer must be run as root."
 }
 
-# ========= INTERNET CONNECTIVITY CHECK =========
-check_internet_connectivity() {
-  dialog --title "Network Test" --infobox "Checking internet connectivity..." 5 50
-  sleep 2
+require_rocky() {
+    [[ -r /etc/os-release ]] || die "Unable to read /etc/os-release."
+    # shellcheck disable=SC1091
+    source /etc/os-release
 
-  local dns_test="FAILED"
-  local ip_test="FAILED"
+    [[ "${ID:-}" == "rocky" ]] || die "This installer supports Rocky Linux only."
 
-  if ping -c 1 -W 2 google.com &>/dev/null; then
-    dns_test="SUCCESS"
-  fi
+    local major="${VERSION_ID%%.*}"
+    [[ "$major" =~ ^[0-9]+$ ]] || die "Unable to determine Rocky Linux version."
+    (( major >= 9 )) || die "Rocky Linux 9 or newer is required."
 
-  if ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
-    ip_test="SUCCESS"
-  fi
+    log "Detected Rocky Linux ${VERSION_ID}."
+}
 
-  dialog --title "Connectivity Test Results" --infobox "DNS Resolution: $dns_test
-Direct IP (8.8.8.8): $ip_test " 7 50
-  sleep 4
-
-  if [[ "$dns_test" == "FAILED" || "$ip_test" == "FAILED" ]]; then
-    dialog --title "Network Warning" --yesno "Internet connectivity issues detected. Do you want to continue?" 7 50
-    if [[ $? -ne 0 ]]; then
-      exit 1
+install_dialog_early() {
+    if ! command -v dialog >/dev/null 2>&1; then
+        dnf -y install dialog >>"$LOG_FILE" 2>&1 || {
+            printf 'Unable to install dialog. See %s\n' "$LOG_FILE" >&2
+            exit 1
+        }
     fi
-  fi
 }
 
-# ========= HOSTNAME VALIDATION =========
-validate_and_set_hostname() {
-  local current_hostname
-  current_hostname=$(hostname)
-
-  if [[ "$current_hostname" == "localhost.localdomain" ]]; then
-    while true; do
-      NEW_HOSTNAME=$(dialog --title "Hostname Configuration" --inputbox \
-        "Current hostname is '$current_hostname'. Please enter a new FQDN (e.g., server.example.com):" \
-        8 60 3>&1 1>&2 2>&3)
-
-      if validate_fqdn "$NEW_HOSTNAME" && check_hostname_in_domain "$NEW_HOSTNAME"; then
-        hostnamectl set-hostname "$NEW_HOSTNAME"
-        dialog --title "Hostname Set" --msgbox "Hostname updated to: $NEW_HOSTNAME" 6 50
-        break
-      else
-        dialog --title "Invalid Hostname" --msgbox "Invalid hostname. Please try again." 6 50
-      fi
+validate_ipv4() {
+    local ip="$1" IFS=. octet
+    read -r -a octets <<<"$ip"
+    [[ ${#octets[@]} -eq 4 ]] || return 1
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        (( octet >= 0 && octet <= 255 )) || return 1
     done
-  else
-    # Show a temporary info box with current hostname, no OK button
-    dialog --title "Hostname Check" --infobox \
-      "Hostname set to: $current_hostname" 6 60
-    sleep 3
-  fi
 }
 
-# ========= SYSTEM UPDATE & PACKAGE INSTALL =========
-update_and_install_packages() {
-  # Simulate progress while enabling EPEL and CRB
-  dialog --title "Repository Setup" --gauge "Enabling EPEL and CRB repositories..." 10 60 0 < <(
-    (
-      (
-        dnf install -y epel-release >/dev/null 2>&1
-        dnf config-manager --set-enabled crb >/dev/null 2>&1
-      ) &
-      PID=$!
-      PROGRESS=0
-      while kill -0 "$PID" 2>/dev/null; do
-        echo "$PROGRESS"
-        echo "XXX"
-        echo "Enabling EPEL and CRB..."
-        echo "XXX"
-        ((PROGRESS += 5))
-        if [[ $PROGRESS -ge 95 ]]; then
-          PROGRESS=5
-        fi
-        sleep 0.5
-      done
-      echo "100"
-      echo "XXX"
-      echo "Repositories enabled."
-      echo "XXX"
+validate_cidr() {
+    local cidr="$1" ip prefix
+    [[ "$cidr" == */* ]] || return 1
+    ip="${cidr%/*}"
+    prefix="${cidr#*/}"
+    validate_ipv4 "$ip" || return 1
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    (( prefix >= 0 && prefix <= 32 ))
+}
+
+validate_vlan() {
+    local vlan="$1"
+    [[ "$vlan" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$vlan >= 1 && 10#$vlan <= 4094 ))
+}
+
+validate_fqdn() {
+    local name="$1"
+    [[ "$name" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] &&
+        [[ "$name" == *.* ]]
+}
+
+show_welcome() {
+    dialog --title "Rocky KVM Builder ${SCRIPT_VERSION}" --msgbox \
+"Rocky Linux KVM Host Builder
+
+This installer configures:
+
+ • KVM, libvirt, Cockpit and supporting packages
+ • Chrony NTP
+ • Fail2Ban
+ • A native/untagged management bridge
+ • Explicit VLAN bridges named br10, br20, br30, and so on
+
+IMPORTANT:
+The final network cutover interrupts connectivity.
+Use a local console or ensure out-of-band access is available." 18 78
+}
+
+detect_active_management() {
+    MGMT_DEVICE=$(ip -4 route show default | awk 'NR==1 {print $5}')
+    MGMT_GATEWAY=$(ip -4 route show default | awk 'NR==1 {print $3}')
+
+    [[ -n "${MGMT_DEVICE:-}" ]] || die "No IPv4 default-route interface was found."
+
+    MGMT_CONNECTION=$(nmcli -t -f NAME,DEVICE connection show --active |
+        awk -F: -v dev="$MGMT_DEVICE" '$2 == dev {print $1; exit}')
+
+    [[ -n "${MGMT_CONNECTION:-}" ]] ||
+        die "No active NetworkManager profile was found for $MGMT_DEVICE."
+
+    MGMT_ADDRESS=$(nmcli -g ipv4.addresses connection show "$MGMT_CONNECTION" |
+        sed '/^$/d' | head -n1)
+
+    [[ -n "$MGMT_ADDRESS" ]] ||
+        MGMT_ADDRESS=$(ip -4 -o addr show dev "$MGMT_DEVICE" scope global |
+            awk '{print $4; exit}')
+
+    MGMT_DNS=$(nmcli -g ipv4.dns connection show "$MGMT_CONNECTION" |
+        sed '/^$/d' | paste -sd, -)
+
+    MGMT_SEARCH=$(nmcli -g ipv4.dns-search connection show "$MGMT_CONNECTION" |
+        sed '/^$/d' | paste -sd, -)
+
+    MGMT_METHOD=$(nmcli -g ipv4.method connection show "$MGMT_CONNECTION" |
+        tr -d '[:space:]')
+
+    log "Management device: $MGMT_DEVICE"
+    log "Management profile: $MGMT_CONNECTION"
+    log "Management address: ${MGMT_ADDRESS:-none}"
+    log "Management gateway: ${MGMT_GATEWAY:-none}"
+}
+
+configure_static_ip_if_needed() {
+    if [[ "$MGMT_METHOD" == "manual" && -n "$MGMT_ADDRESS" && -n "$MGMT_GATEWAY" ]]; then
+        dialog --title "Static Management Address" --infobox \
+            "Using existing static address:\n\n$MGMT_ADDRESS via $MGMT_GATEWAY" 8 60
+        sleep 2
+        return
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    TMP_FILES+=("$tmp")
+
+    while true; do
+        dialog --title "Static Management Address" --inputbox \
+            "Enter the static host address in CIDR format:" 8 62 \
+            "${MGMT_ADDRESS:-}" 2>"$tmp" || exit 1
+        MGMT_ADDRESS=$(<"$tmp")
+        validate_cidr "$MGMT_ADDRESS" && break
+        dialog --msgbox "Invalid IPv4 CIDR address." 6 45
+    done
+
+    while true; do
+        dialog --title "Default Gateway" --inputbox \
+            "Enter the IPv4 default gateway:" 8 62 \
+            "${MGMT_GATEWAY:-}" 2>"$tmp" || exit 1
+        MGMT_GATEWAY=$(<"$tmp")
+        validate_ipv4 "$MGMT_GATEWAY" && break
+        dialog --msgbox "Invalid IPv4 address." 6 45
+    done
+
+    dialog --title "DNS Servers" --inputbox \
+        "Enter comma-separated DNS servers:" 8 62 \
+        "${MGMT_DNS:-1.1.1.1,8.8.8.8}" 2>"$tmp" || exit 1
+    MGMT_DNS=$(<"$tmp")
+
+    dialog --title "DNS Search Domain" --inputbox \
+        "Enter the DNS search suffix, or leave blank:" 8 62 \
+        "${MGMT_SEARCH:-}" 2>"$tmp" || exit 1
+    MGMT_SEARCH=$(<"$tmp")
+
+    run nmcli connection modify "$MGMT_CONNECTION" \
+        ipv4.method manual \
+        ipv4.addresses "$MGMT_ADDRESS" \
+        ipv4.gateway "$MGMT_GATEWAY"
+
+    [[ -n "$MGMT_DNS" ]] &&
+        run nmcli connection modify "$MGMT_CONNECTION" ipv4.dns "$MGMT_DNS"
+    [[ -n "$MGMT_SEARCH" ]] &&
+        run nmcli connection modify "$MGMT_CONNECTION" ipv4.dns-search "$MGMT_SEARCH"
+
+    run nmcli connection modify "$MGMT_CONNECTION" ipv4.ignore-auto-dns yes
+}
+
+configure_hostname() {
+    local current tmp proposed
+    current=$(hostnamectl --static 2>/dev/null || hostname)
+
+    if [[ "$current" != "localhost" && "$current" != "localhost.localdomain" && "$current" == *.* ]]; then
+        dialog --title "Hostname" --infobox "Using hostname: $current" 6 60
+        sleep 2
+        return
+    fi
+
+    tmp=$(mktemp)
+    TMP_FILES+=("$tmp")
+
+    while true; do
+        dialog --title "Hostname" --inputbox \
+            "Enter the host FQDN, for example kvm01.home.int:" 8 65 \
+            "$current" 2>"$tmp" || exit 1
+        proposed=$(<"$tmp")
+        validate_fqdn "$proposed" && break
+        dialog --msgbox "Enter a valid fully qualified hostname." 6 52
+    done
+
+    run hostnamectl set-hostname "$proposed"
+}
+
+configure_selinux() {
+    local status
+    status=$(getenforce 2>/dev/null || true)
+
+    case "$status" in
+        Enforcing)
+            log "SELinux is enforcing."
+            ;;
+        Permissive)
+            sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+            run setenforce 1
+            ;;
+        Disabled)
+            sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+            dialog --title "SELinux" --msgbox \
+                "SELinux was disabled. It has been set to enforcing for the next boot." 7 68
+            ;;
+        *)
+            log "Unable to determine SELinux status."
+            ;;
+    esac
+}
+
+install_packages() {
+    dialog --title "Packages" --infobox \
+        "Updating repositories and installing KVM/Cockpit packages..." 6 72
+
+    run dnf -y install epel-release dnf-plugins-core
+    run dnf config-manager --set-enabled crb
+    run dnf -y upgrade
+
+    local packages=(
+        qemu-kvm
+        libvirt
+        virt-install
+        virt-manager
+        virt-viewer
+        cockpit
+        cockpit-machines
+        cockpit-storaged
+        cockpit-files
+        fail2ban
+        tuned
+        chrony
+        rsync
+        iptraf-ng
+        net-tools
+        dmidecode
+        ipcalc
+        bind-utils
+        iotop
+        zip
+        nano
+        curl
+        wget
+        smartmontools
+        nvme-cli
+        policycoreutils-python-utils
+        dnf-automatic
     )
-  )
 
-  dialog --title "System Update" --infobox "Checking for updates. This may take a few moments..." 5 70
-  sleep 2
+    run dnf -y install "${packages[@]}"
+}
 
-  dnf check-update -y &>/dev/null
+configure_ntp() {
+    local tmp input server
+    tmp=$(mktemp)
+    TMP_FILES+=("$tmp")
 
-  TEMP_FILE=$(mktemp)
-  dnf check-update | awk '{print $1}' | grep -vE '^$|Obsoleting|Last' | awk -F'.' '{print $1}' | sort -u > "$TEMP_FILE"
+    dialog --title "Chrony NTP" --inputbox \
+        "Enter up to three comma-separated NTP servers:" 9 70 \
+        "pool.ntp.org" 2>"$tmp" || return 0
+    input=$(<"$tmp")
 
-  PACKAGE_LIST=($(cat "$TEMP_FILE"))
-  TOTAL_PACKAGES=${#PACKAGE_LIST[@]}
+    [[ -n "$input" ]] || return 0
 
-  if [[ "$TOTAL_PACKAGES" -eq 0 ]]; then
-    dialog --title "System Update" --msgbox "No updates available!" 6 50
-    rm -f "$TEMP_FILE"
-  else
-    PIPE=$(mktemp -u)
-    mkfifo "$PIPE"
-    dialog --title "System Update" --gauge "Installing updates..." 10 70 0 < "$PIPE" &
-    exec 3>"$PIPE"
-    COUNT=0
-    for PACKAGE in "${PACKAGE_LIST[@]}"; do
-      ((COUNT++))
-      PERCENT=$(( (COUNT * 100) / TOTAL_PACKAGES ))
-      echo "$PERCENT" > "$PIPE"
-      echo "XXX" > "$PIPE"
-      echo "Updating: $PACKAGE" > "$PIPE"
-      echo "XXX" > "$PIPE"
-      dnf -y install "$PACKAGE" >/dev/null 2>&1
+    cp -a /etc/chrony.conf "/etc/chrony.conf.bak.$(date +%Y%m%d-%H%M%S)"
+    sed -i '/^[[:space:]]*\(server\|pool\)[[:space:]]/d' /etc/chrony.conf
+
+    IFS=',' read -r -a servers <<<"$input"
+    for server in "${servers[@]}"; do
+        server=$(echo "$server" | xargs)
+        [[ -n "$server" ]] && printf 'server %s iburst\n' "$server" >>/etc/chrony.conf
     done
-    exec 3>&-
-    rm -f "$PIPE" "$TEMP_FILE"
-  fi
 
-  dialog --title "Package Installation" --infobox "Installing Required Packages..." 5 50
-  sleep 2
-  PACKAGE_LIST=("ntsysv" "rsync" "iptraf" "fail2ban" "tuned" "qemu-kvm" "libvirt" "virt-install" "virt-manager" "virt-viewer" "cockpit" "cockpit-storaged" "cockpit-machines" "cockpit-files" "net-tools" "dmidecode" "ipcalc" "bind-utils"  "iotop" "zip" "yum-utils" "nano" "curl" "wget" "dnf-automatic")
-  TOTAL_PACKAGES=${#PACKAGE_LIST[@]}
-
-  PIPE=$(mktemp -u)
-  mkfifo "$PIPE"
-  dialog --title "Installing Required Packages" --gauge "Preparing to install packages..." 10 70 0 < "$PIPE" &
-  exec 3>"$PIPE"
-  COUNT=0
-  for PACKAGE in "${PACKAGE_LIST[@]}"; do
-    ((COUNT++))
-    PERCENT=$(( (COUNT * 100) / TOTAL_PACKAGES ))
-    echo "$PERCENT" > "$PIPE"
-    echo "XXX" > "$PIPE"
-    echo "Installing: $PACKAGE" > "$PIPE"
-    echo "XXX" > "$PIPE"
-    dnf -y install "$PACKAGE" >/dev/null 2>&1
-  done
-  exec 3>&-
-  rm -f "$PIPE"
-  dialog --title "Installation Complete" --infobox "All packages installed successfully!" 6 50
-  sleep 3
-}
-#===========DETECT VIRT and INSTALL GUEST=============
-# Function to show a dialog infobox
-vm_detection() {
-show_info() {
-    dialog --title "$1" --infobox "$2" 5 60
-    sleep 2
+    run systemctl enable --now chronyd
+    run systemctl restart chronyd
 }
 
-# Function to show a progress bar during installation
-show_progress() {
-    (
-        echo "10"; sleep 1
-        echo "40"; sleep 1
-        echo "70"; sleep 1
-        echo "100"
-    ) | dialog --title "$1" --gauge "$2" 7 60 0
-}
-
-# Detect virtualization platform
-HWKVM=$(dmidecode | grep -i -e manufacturer -e product -e vendor | grep KVM | cut -c16-)
-HWVMWARE=$(dmidecode | grep -i -e manufacturer -e product -e vendor | grep Manufacturer | grep "VMware, Inc." | cut -c16- | cut -d , -f1)
-
-show_info "Virtualization Check" "Checking for virtualization platform..."
-
-# Install guest agent for KVM
-if [ "$HWKVM" = "KVM" ]; then
-    show_info "Platform Detected" "KVM platform detected.\nInstalling qemu-guest-agent..."
-    show_progress "Installing qemu-guest-agent" "Installing guest tools for KVM..."
-    dnf -y install qemu-guest-agent &>/dev/null
-fi
-
-# Install guest agent for VMware
-if [ "$HWVMWARE" = "VMware" ]; then
-    show_info "Platform Detected" "VMware platform detected.\nInstalling open-vm-tools..."
-    show_progress "Installing open-vm-tools" "Installing guest tools for VMware..."
-    dnf -y install open-vm-tools &>/dev/null
-fi
-}
-
-# ========= CONFIGURE FAIL2BAN =========
 configure_fail2ban() {
+    mkdir -p /etc/fail2ban/jail.d
 
-    LOG_FILE="/tmp/fail2ban_configure.log"
-    mkdir -p "$(dirname "$LOG_FILE")"
-    touch "$LOG_FILE"
-
-    log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_FILE"
-}
-
-    dialog --title "Fail2Ban Configuration" --infobox "Configuring Fail2Ban service..." 4 50
-    log "Configuring Fail2Ban service..."
-
-    ORIGINAL_FILE="/etc/fail2ban/jail.conf"
-    JAIL_LOCAL_FILE="/etc/fail2ban/jail.local"
-    SSHD_LOCAL_FILE="/etc/fail2ban/jail.d/sshd.local"
-
-    if cp -v "$ORIGINAL_FILE" "$JAIL_LOCAL_FILE" >> "$LOG_FILE" 2>&1; then
-        log "Copied jail.conf to jail.local"
-    else
-        log "Failed to copy jail.conf"
-        dialog --title "Fail2Ban Configuration" --msgbox "ERROR: Failed to copy jail.conf to jail.local" 6 50
-        return 1
-    fi
-
-    if sed -i '/^\[sshd\]/,/^$/ s/#mode.*normal/&\nenabled = true/' "$JAIL_LOCAL_FILE" >> "$LOG_FILE" 2>&1; then
-        log "Modified jail.local to enable SSHD"
-    else
-        log "Failed to modify jail.local"
-        dialog --title "Fail2Ban Configuration" --msgbox "ERROR: Failed to modify jail.local to enable SSHD" 6 50
-        return 1
-    fi
-
-    cat <<EOL > "$SSHD_LOCAL_FILE"
+    cat >/etc/fail2ban/jail.d/sshd.local <<'EOF'
 [sshd]
 enabled = true
 maxretry = 5
@@ -445,392 +344,326 @@ findtime = 300
 bantime = 3600
 bantime.increment = true
 bantime.factor = 2
-EOL
-    log "Created $SSHD_LOCAL_FILE"
+EOF
 
-    dialog --title "Fail2Ban Configuration" --infobox "Starting and enabling Fail2Ban..." 4 50
-    systemctl enable fail2ban >> "$LOG_FILE" 2>&1
-    systemctl start fail2ban >> "$LOG_FILE" 2>&1
-    sleep 2
-
-    if systemctl is-active --quiet fail2ban; then
-        log "Fail2Ban is running."
-    else
-        log "Fail2Ban failed to start. Checking SELinux..."
-
-        selinux_status=$(sestatus | grep "SELinux status" | awk '{print $3}')
-        if [ "$selinux_status" == "enabled" ]; then
-            restorecon -v /etc/fail2ban/jail.local >> "$LOG_FILE" 2>&1
-            denials=$(ausearch -m avc -ts recent | grep "fail2ban-server" | wc -l)
-            if [ "$denials" -gt 0 ]; then
-                dialog --title "Fail2Ban Configuration" --infobox "Applying SELinux policy for Fail2Ban..." 4 50
-                ausearch -c 'fail2ban-server' --raw | audit2allow -M my-fail2banserver >> "$LOG_FILE" 2>&1
-                semodule -X 300 -i my-fail2banserver.pp >> "$LOG_FILE" 2>&1
-                log "Custom SELinux policy for Fail2Ban applied."
-            fi
-        fi
-
-        systemctl restart fail2ban >> "$LOG_FILE" 2>&1
-        if systemctl is-active --quiet fail2ban; then
-            log "Fail2Ban started after SELinux policy."
-        else
-            log "Fail2Ban still not running after SELinux fix."
-            dialog --title "Fail2Ban Configuration" --msgbox "ERROR: Fail2Ban failed to start even after SELinux fix." 6 60
-            return 1
-        fi
-    fi
-
-    sshd_status=$(fail2ban-client status sshd 2>&1)
-
-    if echo "$sshd_status" | grep -q "ERROR   NOK: ('sshd',)"; then
-        log "SSHD jail failed to start."
-        dialog --title "Fail2Ban Configuration" --msgbox "ERROR: SSHD jail failed to start. Check configuration." 6 60
-    elif echo "$sshd_status" | grep -E "Banned IP list:"; then
-        log "SSHD jail is active."
-    else
-        log "SSHD jail may not be working correctly."
-        dialog --title "Fail2Ban Configuration" --msgbox "WARNING: SSHD jail may not be functional. Please check." 6 60
-    fi
-
-    dialog --infobox "Fail2Ban configured successfully!" 4 50
-    sleep 3
-
-    log "Fail2Ban configuration complete."
+    restorecon -RFv /etc/fail2ban >>"$LOG_FILE" 2>&1 || true
+    run systemctl enable --now fail2ban
 }
 
-# ========= CONFIGURE CHRONY =========
-declare -a ADDR
-LOG_NTP="/tmp/chrony_ntp_configure.log"
-touch "$LOG_NTP"
-
-log_ntp() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$LOG_NTP"
+enable_services() {
+    run systemctl enable --now libvirtd
+    run systemctl enable --now cockpit.socket
+    run systemctl enable --now tuned
+    run tuned-adm profile virtual-host
 }
 
-prompt_ntp_servers() {
-    while true; do
-        NTP_SERVERS=$(dialog --title "Chrony NTP Configuration" \
-            --inputbox "Enter up to 3 comma-separated NTP server IPs or FQDNs:" 8 60 \
-            3>&1 1>&2 2>&3)
-        exit_status=$?
-        if [ $exit_status -eq 1 ] || [ $exit_status -eq 255 ]; then
-            return 1
-        fi
+offer_home_reclaim() {
+    local home_dev root_lv backup
+    home_dev=$(findmnt -n -o SOURCE /home 2>/dev/null || true)
 
-        if [[ -n "$NTP_SERVERS" ]]; then
-            IFS=',' read -ra ADDR <<< "$NTP_SERVERS"
-            if (( ${#ADDR[@]} > 3 )); then
-                dialog --title "Chrony NTP Configuration" --msgbox "You may only enter up to 3 servers." 6 50
-                continue
-            fi
-            return 0
-        else
-            dialog --title "Chrony NTP Configuration" --msgbox "The input cannot be blank. Please try again." 6 50
-        fi
-    done
-}
+    [[ "$home_dev" == /dev/mapper/* ]] || return 0
 
-update_chrony_config() {
-    cp /etc/chrony.conf /etc/chrony.conf.bak
-    sed -i '/^\(server\|pool\)[[:space:]]/d' /etc/chrony.conf
+    dialog --title "Optional LVM Reclaim" --yesno \
+"/home is on a separate logical volume:
 
-    for srv in "${ADDR[@]}"; do
-        echo "server ${srv} iburst" >> /etc/chrony.conf
-        log_ntp "Added server ${srv} to chrony.conf"
-    done
+$home_dev
 
-    systemctl restart chronyd
-    sleep 2
-}
+Would you like to remove that logical volume, extend the root filesystem,
+and restore /home as a normal directory?
 
-validate_time_sync() {
-    local attempt=1
-    local success=0
+Choose No unless you specifically want this behavior." 14 76 || return 0
 
-    while (( attempt <= 3 )); do
-        dialog --title "Chrony NTP Configuration" --infobox "Validating time sync... Attempt $attempt/3" 4 50
-        sleep 5
+    root_lv=$(findmnt -n -o SOURCE /)
+    backup="/root/home-backup-$(date +%Y%m%d-%H%M%S)"
 
-        TRACKING=$(chronyc tracking 2>&1)
-        echo "$TRACKING" >> "$LOG_NTP"
+    mkdir -p "$backup"
+    run rsync -aHAX /home/ "$backup/"
+    run umount /home
+    run lvremove -y "$home_dev"
+    run lvextend -l +100%FREE "$root_lv"
 
-        if echo "$TRACKING" | grep -q "Leap status[[:space:]]*:[[:space:]]*Normal"; then
-            success=1
-            break
-        fi
-        ((attempt++))
-    done
+    case "$(findmnt -n -o FSTYPE /)" in
+        xfs) run xfs_growfs / ;;
+        ext4) run resize2fs "$root_lv" ;;
+        *) die "Unsupported root filesystem for automatic resize." ;;
+    esac
 
-    if [[ "$success" -eq 1 ]]; then
-        dialog --title "Chrony NTP Configuration" --msgbox "Time synchronized successfully:\n\n$TRACKING" 15 80
-    else
-        dialog --title "Chrony NTP Configuration" --yesno "Time sync failed after 3 attempts.\nDo you want to proceed anyway?" 8 70
-        [[ $? -eq 0 ]] || return 1
-    fi
-    return 0
-}
-
-# ========= START SERVICES  =========
-check_and_enable_services() {
-    SERVICES=("libvirtd" "cockpit.socket" "fail2ban")
-    for svc in "${SERVICES[@]}"; do
-        dialog --infobox "Checking and enabling '$svc'..." 5 50
-        sleep 1
-        if systemctl is-enabled --quiet "$svc"; then
-            if systemctl is-active --quiet "$svc"; then
-                dialog --infobox "$svc is already enabled and running." 5 50
-            else
-                systemctl start "$svc"
-                dialog --infobox "$svc was enabled but not running. Started now." 5 50
-            fi
-        else
-            systemctl enable --now "$svc"
-            if systemctl is-active --quiet "$svc"; then
-                dialog --infobox "$svc has been enabled and started successfully." 5 50
-            else
-                dialog --msgbox "Failed to start or enable $svc.\nPlease check systemctl status $svc manually." 7 60
-            fi
-        fi
-        sleep 2
-    done
-
-    dialog --title "Service Check Complete" --msgbox \
-    "All required services have been verified:\n\n• libvirtd\n• cockpit.socket\n• fail2ban\n\nIf any were not running, they were started and enabled for boot." 12 60
-}
-
-# ========= RECLAIM SPACE FROM HOME MAPPER (LVM)  =========
-remove_home_mapper() {
-    TMP_FILE=$(mktemp)
-    MOUNTPOINT_HOME=$(df -h | awk '$6 == "/home" {print $1}')
-    LOGICAL_VOL_HOME=$(lvs --noheadings -o lv_name,vg_name | awk '$1 == "home" {print $1, $2}')
-    BACKUP_DIR="/root/home-backup"
-
-    if [[ "$MOUNTPOINT_HOME" != /dev/mapper/*home* ]]; then
-        dialog --title "Info" --msgbox "No separate /home LVM volume detected. Nothing to do." 6 50
-        return 0
-    fi
-
-    dialog --title "WARNING: Remove /home Volume" --yesno \
-    "This will:\n
-- Unmount /home (currently $MOUNTPOINT_HOME)\n
-- Delete the LVM volume backing it\n
-- Extend the root LVM volume to use that space\n
-- Recreate /home under /\n
-- Restore all user data from /home\n\n
-Continue only if you understand the risk and have a backup.\n\nDo you want to proceed?" 15 60
-    if [ $? -ne 0 ]; then
-        dialog --msgbox "Operation cancelled by user." 6 40
-        return 1
-    fi
-
-    # 1. Backup data
-    dialog --infobox "Backing up contents of /home to $BACKUP_DIR..." 5 50
-    mkdir -p "$BACKUP_DIR"
-    rsync -a /home/ "$BACKUP_DIR/" || {
-        dialog --msgbox "Failed to backup /home. Aborting." 6 50
-        return 1
-    }
-
-    # 2. Unmount /home
-    dialog --infobox "Unmounting /home..." 5 40
-    umount /home || {
-        dialog --msgbox "Failed to unmount /home. Aborting." 6 50
-        return 1
-    }
-
-    # 3. Remove the logical volume
-    lvremove -y "$MOUNTPOINT_HOME" >> /dev/null 2>&1 || {
-        dialog --msgbox "Failed to remove logical volume $MOUNTPOINT_HOME" 6 50
-        return 1
-    }
-
-    # 4. Extend root volume
-    ROOT_LV="/dev/mapper/rl-root"
-    VG_NAME=$(lvs --noheadings -o vg_name "$ROOT_LV" | awk '{print $1}')
-    dialog --infobox "Extending root volume..." 5 40
-    lvextend -l +100%FREE "$ROOT_LV" >> /dev/null 2>&1 || {
-        dialog --msgbox "Failed to extend root volume." 6 50
-        return 1
-    }
-
-    # 5. Resize root filesystem
-    dialog --infobox "Resizing root filesystem..." 5 50
-    xfs_growfs / >> /dev/null 2>&1 || {
-        dialog --msgbox "Failed to resize root filesystem." 6 50
-        return 1
-    }
-
-    # 6. Create new /home and restore data
-    mkdir /home
-    rsync -a "$BACKUP_DIR/" /home/
-
-    # 7. Clean up
-    rm -rf "$BACKUP_DIR"
-
-    # 8. Remove /home mount from /etc/fstab if it exists
-    if grep -q '[[:space:]]/home[[:space:]]' /etc/fstab; then
-    dialog --infobox "Cleaning up /etc/fstab entry for /home..." 5 50
     sed -i.bak '/[[:space:]]\/home[[:space:]]/d' /etc/fstab
-fi
-
-    dialog --title "Success" --msgbox \
-    "The /home LVM volume was removed and the space has been merged into root.\n\nAll data was preserved." 10 60
-}
-# ========= SHOW INFO on VLANS  =========
-show_vlan_warning() {
-    dialog --title "VLAN Preparation Notice" --msgbox \
-"The next step will configure the system for the VLANs used by Virtual Machines.
-
-Your network switch should already be set to TRUNK mode with an untagged (native) VLAN.
-
-The current static IP will be moved to the Untagged VLAN bridge for management access.
-This provides isolation between management traffic and VM traffic.
-
-STP (Spanning Tree Protocol) will be disabled on all interfaces created by this script.
-Ensure STP is configured appropriately on your switch.
-
-Please verify your switch configuration before continuing.
-
-AFTER YOU SET THESE OPTIONS THE INTERFACES WILL RESET AND CONNECITVITY WILL BE LOST
-
-IF YOU ARE ON AN SSH SESSION YOU MUST REBOOT THE SERVER FROM THE CONSOLE" 30 100
+    mkdir -p /home
+    run rsync -aHAX "$backup/" /home/
+    rm -rf "$backup"
+    restorecon -RFv /home >>"$LOG_FILE" 2>&1 || true
 }
 
+profile_exists() {
+    nmcli -t -f NAME connection show | grep -Fxq "$1"
+}
 
-# ========= SET BRIDGE and VLANS  =========
+delete_profile_if_exists() {
+    local profile="$1"
+    if profile_exists "$profile"; then
+        log "Deleting existing profile: $profile"
+        nmcli connection delete "$profile" >>"$NETWORK_LOG" 2>&1
+    fi
+}
+
+set_bridge_autoconnect_ports() {
+    local bridge="$1"
+    nmcli connection modify "$bridge" connection.autoconnect yes >>"$NETWORK_LOG" 2>&1
+    nmcli connection modify "$bridge" connection.autoconnect-ports 1 >>"$NETWORK_LOG" 2>&1 ||
+        nmcli connection modify "$bridge" connection.autoconnect-slaves 1 >>"$NETWORK_LOG" 2>&1 ||
+        true
+}
+
 configure_vlans() {
-    local TMP_FILE
-    TMP_FILE=$(mktemp)
-    local LOG_FILE="/var/log/kvm_vlan_setup.log"
+    local tmp interface_list selected all_vlans native_vlan native_bridge
+    local original_profile native_port vlan vlan_if vlan_bridge
+    local backup_dir timestamp
+    local -a vlan_array unique_vlans
+    declare -A seen=()
 
-    # Get interfaces
-    interfaces=$(nmcli device status | awk '$2 == "ethernet" && $3 == "connected" {print $1}')
+    tmp=$(mktemp)
+    TMP_FILES+=("$tmp")
+    : >"$NETWORK_LOG"
+
     interface_list=""
-    for iface in $interfaces; do
-        interface_list+="$iface '' "
-    done
+    while IFS=: read -r dev type state; do
+        [[ "$type" == "ethernet" && "$state" == "connected" ]] || continue
+        interface_list+="$dev ${dev} "
+    done < <(nmcli -t -f DEVICE,TYPE,STATE device status)
 
-    # Prompt for trunk interface
-    chosen_iface=$(dialog --clear --title "Select Trunk Interface" --menu \
-        "Choose the interface to act as trunk:" 15 50 5 $interface_list 2>&1 >/dev/tty)
-    if [ -z "$chosen_iface" ]; then
-        dialog --msgbox "No interface selected. Exiting." 6 40
-        clear; return 1
-    fi
+    [[ -n "$interface_list" ]] || die "No connected Ethernet device was found."
 
-    # Prompt for VLANs to create
-    dialog --inputbox "Enter comma-separated VLAN IDs to create (e.g., 10,20,30):" 8 60 2>$TMP_FILE
-    VLAN_IDS=$(<"$TMP_FILE")
+    selected=$(dialog --title "Trunk Interface" --menu \
+        "Select the physical interface connected to the switch trunk:" \
+        16 72 8 $interface_list 2>&1 >/dev/tty) || exit 1
 
-    # Detect static IP and gateway
-    mgmt_iface=$(ip route | grep default | awk '{print $5}' | head -n1)
-    mgmt_ip=$(ip -4 addr show dev "$mgmt_iface" | awk '/inet / {print $2}' | head -n1)
-    mgmt_gw=$(ip route | grep default | awk '{print $3}' | head -n1)
+    original_profile=$(nmcli -t -f NAME,DEVICE connection show --active |
+        awk -F: -v dev="$selected" '$2 == dev {print $1; exit}')
 
-    if [ -z "$mgmt_ip" ] || [ -z "$mgmt_gw" ]; then
-        dialog --msgbox "Unable to detect the current static IP or gateway. Please configure networking first." 7 60
-        return 1
-    fi
+    [[ -n "$original_profile" ]] ||
+        die "No active NetworkManager profile was found for $selected."
 
-    # Prompt for native VLAN, showing current IP/gateway
-    dialog --inputbox "The system is currently using:\n\n  IP Address: $mgmt_ip\n  Gateway: $mgmt_gw\n\nPlease enter the native (untagged) VLAN ID for this management IP:" 12 60 2>$TMP_FILE
-    NATIVE_VLAN=$(<"$TMP_FILE")
+    dialog --title "Tagged VLANs" --inputbox \
+        "Enter comma-separated tagged VLAN IDs for VM networks.\n\nExample: 10,18,20,30,45,46,47" \
+        10 72 2>"$tmp" || exit 1
+    all_vlans=$(tr -d '[:space:]' <"$tmp")
 
-    HOST_IP="$mgmt_ip"
-    GATEWAY="$mgmt_gw"
+    [[ -n "$all_vlans" ]] || die "At least one tagged VLAN is required."
 
-    # Confirm all settings
-    dialog --title "Review Configuration" --yesno "Management IP: $HOST_IP\nGateway: $GATEWAY\nNative VLAN: $NATIVE_VLAN\nTagged VLANs: $VLAN_IDS\nTrunk Interface: $chosen_iface\n\nProceed with configuration?" 15 60
-    [ $? -ne 0 ] && { dialog --msgbox "Operation cancelled." 6 40; return 1; }
+    IFS=',' read -r -a vlan_array <<<"$all_vlans"
+    unique_vlans=()
 
-    # Create native bridge
-    native_bridge="br${NATIVE_VLAN}"
-    nmcli con add type bridge con-name "$native_bridge"
-    nmcli con mod "$native_bridge" bridge.stp no
-    nmcli con add type bridge-slave ifname "$chosen_iface" master "$native_bridge"
-    nmcli con mod "$native_bridge" ipv4.addresses "$HOST_IP"
-    nmcli con mod "$native_bridge" ipv4.gateway "$GATEWAY"
-    nmcli con mod "$native_bridge" ipv4.method manual
-
-    # Create VLAN bridges
-    IFS=',' read -r -a vlan_array <<< "$VLAN_IDS"
     for vlan in "${vlan_array[@]}"; do
-        vlan_id=$(echo "$vlan" | tr -d ' ')
-        if [ "$vlan_id" == "$NATIVE_VLAN" ]; then continue; fi
-
-        vlan_con="vlan${vlan_id}"
-        bridge_con="br${vlan_id}"
-        nmcli con add type vlan con-name "$vlan_con" dev "$chosen_iface" id "$vlan_id"
-        nmcli con add type bridge con-name "$bridge_con"
-        nmcli con mod "$bridge_con" bridge.stp no
-        nmcli con add type bridge-slave ifname "$vlan_con" master "$bridge_con"
-        nmcli con mod "$vlan_con" ipv4.method disabled
-        nmcli con mod "$vlan_con" ipv6.method disabled
-        nmcli con mod "$bridge_con" ipv4.method disabled
-        nmcli con mod "$bridge_con" ipv6.method disabled
+        validate_vlan "$vlan" || die "Invalid VLAN ID: $vlan"
+        if [[ -z "${seen[$vlan]:-}" ]]; then
+            unique_vlans+=("$vlan")
+            seen["$vlan"]=1
+        fi
     done
 
-    # Disable IP on physical trunk interface
-    nmcli con mod "$chosen_iface" ipv4.method disabled
-    nmcli con down "$chosen_iface"
-    nmcli con up "$chosen_iface"
+    while true; do
+        dialog --title "Native Management VLAN" --inputbox \
+"The current host management address is:
 
-    # Remove auto-run block from .bash_profile
-    sed -i '/^## Run KVM installer/,/^fi$/d' /root/.bash_profile
+  Address: $MGMT_ADDRESS
+  Gateway: $MGMT_GATEWAY
+  Device:  $selected
 
-    rm -rf /root/KVM
+Enter the switchport native/untagged VLAN ID.
+The management IP will be placed on br<VLAN>." 14 72 2>"$tmp" || exit 1
+        native_vlan=$(tr -d '[:space:]' <"$tmp")
+        validate_vlan "$native_vlan" && break
+        dialog --msgbox "Invalid native VLAN ID." 6 45
+    done
 
+    native_bridge="br${native_vlan}"
 
-    # Prompt before reboot
+    dialog --title "Review Network Configuration" --yesno \
+"Physical trunk: $selected
+Native VLAN:     $native_vlan
+Management:      $MGMT_ADDRESS via $MGMT_GATEWAY
+Native bridge:   $native_bridge
+Tagged VLANs:    $(IFS=,; echo "${unique_vlans[*]}")
+
+Cockpit will display bridges by VLAN:
+br10, br18, br20, br30, and so forth.
+
+The network cutover will interrupt SSH.
+Continue?" 18 78 || exit 1
+
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    backup_dir="/root/NetworkManager-backup-${timestamp}"
+    mkdir -p "$backup_dir"
+    cp -a /etc/NetworkManager/system-connections/. "$backup_dir/" 2>/dev/null || true
+    log "NetworkManager profile backup: $backup_dir"
+
+    # Remove stale profiles from earlier versions of the script.
+    for vlan in "${unique_vlans[@]}"; do
+        delete_profile_if_exists "bridge-slave-vlan${vlan}"
+        delete_profile_if_exists "vlan${vlan}"
+        delete_profile_if_exists "br${vlan}"
+    done
+    delete_profile_if_exists "bridge-slave-${selected}"
+    delete_profile_if_exists "port-${selected}-to-${native_bridge}"
+    delete_profile_if_exists "$native_bridge"
+
+    # Native/untagged bridge owns the host management IP.
+    nmcli connection add \
+        type bridge \
+        con-name "$native_bridge" \
+        ifname "$native_bridge" \
+        bridge.stp no \
+        ipv4.method manual \
+        ipv4.addresses "$MGMT_ADDRESS" \
+        ipv4.gateway "$MGMT_GATEWAY" \
+        ipv6.method disabled \
+        connection.autoconnect yes >>"$NETWORK_LOG" 2>&1
+
+    [[ -n "$MGMT_DNS" ]] &&
+        nmcli connection modify "$native_bridge" \
+            ipv4.dns "$MGMT_DNS" \
+            ipv4.ignore-auto-dns yes >>"$NETWORK_LOG" 2>&1
+
+    [[ -n "$MGMT_SEARCH" ]] &&
+        nmcli connection modify "$native_bridge" \
+            ipv4.dns-search "$MGMT_SEARCH" >>"$NETWORK_LOG" 2>&1
+
+    set_bridge_autoconnect_ports "$native_bridge"
+
+    native_port="port-${selected}-to-${native_bridge}"
+    nmcli connection add \
+        type ethernet \
+        con-name "$native_port" \
+        ifname "$selected" \
+        controller "$native_bridge" \
+        port-type bridge \
+        connection.autoconnect yes >>"$NETWORK_LOG" 2>&1
+
+    # Tagged VLAN bridges. The VLAN profile itself is the bridge port.
+    for vlan in "${unique_vlans[@]}"; do
+        [[ "$vlan" == "$native_vlan" ]] && continue
+
+        vlan_if="${selected}.${vlan}"
+        vlan_bridge="br${vlan}"
+
+        nmcli connection add \
+            type bridge \
+            con-name "$vlan_bridge" \
+            ifname "$vlan_bridge" \
+            bridge.stp no \
+            ipv4.method disabled \
+            ipv6.method disabled \
+            connection.autoconnect yes >>"$NETWORK_LOG" 2>&1
+
+        set_bridge_autoconnect_ports "$vlan_bridge"
+
+        nmcli connection add \
+            type vlan \
+            con-name "vlan${vlan}" \
+            ifname "$vlan_if" \
+            dev "$selected" \
+            id "$vlan" \
+            ipv4.method disabled \
+            ipv6.method disabled \
+            connection.autoconnect yes >>"$NETWORK_LOG" 2>&1
+
+        nmcli connection modify "vlan${vlan}" \
+            connection.controller "$vlan_bridge" \
+            connection.port-type bridge >>"$NETWORK_LOG" 2>&1
+    done
+
+    # Prevent the original standalone NIC profile from returning with the old IP.
+    nmcli connection modify "$original_profile" connection.autoconnect no >>"$NETWORK_LOG" 2>&1
+
+    nmcli connection reload >>"$NETWORK_LOG" 2>&1
+
+    # Activate in dependency order.
+    nmcli connection up "$native_bridge" >>"$NETWORK_LOG" 2>&1 || true
+    nmcli connection up "$native_port" >>"$NETWORK_LOG" 2>&1 || true
+
+    for vlan in "${unique_vlans[@]}"; do
+        [[ "$vlan" == "$native_vlan" ]] && continue
+        nmcli connection up "br${vlan}" >>"$NETWORK_LOG" 2>&1 || true
+        nmcli connection up "vlan${vlan}" >>"$NETWORK_LOG" 2>&1 || true
+    done
+
+    # The old profile must be deactivated last because this interrupts management.
+    nmcli connection down "$original_profile" >>"$NETWORK_LOG" 2>&1 || true
+    nmcli connection up "$native_bridge" >>"$NETWORK_LOG" 2>&1 || true
+    nmcli connection up "$native_port" >>"$NETWORK_LOG" 2>&1 || true
+
+    sleep 5
+
+    {
+        echo
+        echo "===== nmcli active connections ====="
+        nmcli connection show --active
+        echo
+        echo "===== bridge links ====="
+        bridge link
+        echo
+        echo "===== addresses ====="
+        ip -br address
+        echo
+        echo "===== routes ====="
+        ip route
+    } >>"$NETWORK_LOG" 2>&1
+
+    if ! ip link show "$native_bridge" >/dev/null 2>&1; then
+        die "Native bridge $native_bridge was not created. Restore profiles from $backup_dir."
+    fi
+
+    for vlan in "${unique_vlans[@]}"; do
+        [[ "$vlan" == "$native_vlan" ]] && continue
+        if ! ip link show "br${vlan}" >/dev/null 2>&1; then
+            die "Bridge br${vlan} was not created. Restore profiles from $backup_dir."
+        fi
+    done
+
+    sed -i '/^## Run KVM installer/,/^fi$/d' /root/.bash_profile 2>/dev/null || true
+
     dialog --title "Configuration Complete" --msgbox \
-"INSTALLATION COMPLETE!
+"Installation and network configuration are complete.
 
-VLAN and bridge configuration completed successfully.
+Management bridge: $native_bridge
+Management address: $MGMT_ADDRESS
+Cockpit URL: https://${MGMT_ADDRESS%/*}:9090
 
-The system will attempt to reboot and apply network changes.
+Tagged VM bridges:
+$(printf 'br%s ' "${unique_vlans[@]}")
 
-You may have to go to the console and manually reboot if connectivity is lost. 
+Network backup:
+$backup_dir
 
-If it is the OK button below will be non-responsive
+Network log:
+$NETWORK_LOG
 
-You will lose connectivity temporarily." 10 70
-
-    # Clean up temp file
-    rm -f "$TMP_FILE"
-
-    # Queue reboot in background so dialog message finishes
-    (sleep 2 && shutdown -r now "Rebooting to apply VLAN configuration") & disown
-
-    exit 0
+Reboot from the local console if this session does not survive." 20 80
 }
 
+main() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
 
-# ========= MAIN =========
-show_welcome_screen
-detect_active_interface
-prompt_static_ip_if_dhcp
-check_root_and_os
-check_and_enable_selinux
-check_internet_connectivity
-validate_and_set_hostname
-#set_inside_interface
-#=== Set Time ===
-if ! prompt_ntp_servers; then
-    dialog --title "Chrony NTP Configuration" --msgbox "NTP configuration was cancelled." 6 40
-    exit 1
-fi
-update_chrony_config
-if ! validate_time_sync; then
-    dialog --title "Chrony NTP Configuration" --msgbox "Chrony configuration aborted." 6 40
-    exit 1
-fi
-dialog --title "Chrony NTP Configuration" --infobox "Chrony NTP configuration completed successfully." 4 50
-sleep 3
-#=== End Set time ===
-update_and_install_packages
-vm_detection
-configure_fail2ban
-remove_home_mapper
-check_and_enable_services
-show_vlan_warning
-configure_vlans
+    require_root
+    require_rocky
+    install_dialog_early
+    show_welcome
+    detect_active_management
+    configure_static_ip_if_needed
+    configure_hostname
+    configure_selinux
+    install_packages
+    configure_ntp
+    configure_fail2ban
+    enable_services
+    offer_home_reclaim
+    configure_vlans
+
+    dialog --title "Reboot" --yesno \
+        "Reboot now to verify that all bridge and VLAN profiles return correctly?" \
+        8 70 && reboot
+}
+
+main "$@"
