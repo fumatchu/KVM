@@ -307,7 +307,7 @@ install_packages() {
         --gauge "Preparing the system update..." 10 70 0 <"$update_pipe" &
     update_gauge_pid=$!
 
-    (
+    if (
         exec 3>"$update_pipe"
         printf '5\nXXX\nRefreshing repository metadata...\nXXX\n' >&3
         dnf -q makecache >>"$LOG_FILE" 2>&1 || true
@@ -327,9 +327,11 @@ install_packages() {
         done
 
         wait "$dnf_pid"
-        exit $?
-    )
-    update_rc=$?
+    ); then
+        update_rc=0
+    else
+        update_rc=$?
+    fi
 
     wait "$update_gauge_pid" 2>/dev/null || true
     rm -f "$update_pipe"
