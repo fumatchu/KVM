@@ -16,7 +16,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly LOG_FILE="/var/log/kvm_builder.log"
 readonly NETWORK_LOG="/var/log/kvm_vlan_setup.log"
 
@@ -268,34 +268,29 @@ configure_selinux() {
 }
 
 install_packages() {
-    dialog --title "Packages" --infobox \
-        "Updating repositories and installing KVM/Cockpit packages..." 6 72
-
-    run dnf -y install epel-release dnf-plugins-core
-    run dnf config-manager --set-enabled crb
-    run dnf -y upgrade
-
-    local packages=(
+    local pipe gauge_pid package count percent total
+    local -a packages=(
+        ntsysv
+        rsync
+        iptraf-ng
+        fail2ban
+        tuned
         qemu-kvm
         libvirt
         virt-install
         virt-manager
         virt-viewer
         cockpit
-        cockpit-machines
         cockpit-storaged
+        cockpit-machines
         cockpit-files
-        fail2ban
-        tuned
-        chrony
-        rsync
-        iptraf-ng
         net-tools
         dmidecode
         ipcalc
         bind-utils
         iotop
         zip
+        dnf-plugins-core
         nano
         curl
         wget
@@ -303,9 +298,126 @@ install_packages() {
         nvme-cli
         policycoreutils-python-utils
         dnf-automatic
+        chrony
     )
 
-    run dnf -y install "${packages[@]}"
+    # Repository setup gauge. This is activity-based because DNF does not
+    # expose a reliable numeric percentage for repository enablement.
+    pipe=$(mktemp -u)
+    mkfifo "$pipe"
+
+    dialog --title "Repository Setup" \
+        --gauge "Enabling EPEL and CRB repositories..." 10 72 0 <"$pipe" &
+    gauge_pid=$!
+
+    (
+        exec 3>"$pipe"
+        printf '10\nXXX\nInstalling EPEL repository package...\nXXX\n' >&3
+        if ! dnf -y install epel-release >>"$LOG_FILE" 2>&1; then
+            printf '100\nXXX\nEPEL repository setup failed. See %s\nXXX\n' "$LOG_FILE" >&3
+            exit 1
+        fi
+
+        printf '60\nXXX\nEnabling the CRB repository...\nXXX\n' >&3
+        if ! dnf config-manager --set-enabled crb >>"$LOG_FILE" 2>&1; then
+            printf '100\nXXX\nCRB repository setup failed. See %s\nXXX\n' "$LOG_FILE" >&3
+            exit 1
+        fi
+
+        printf '100\nXXX\nRepositories enabled successfully.\nXXX\n' >&3
+        exec 3>&-
+    )
+    local repo_rc=$?
+
+    wait "$gauge_pid" 2>/dev/null || true
+    rm -f "$pipe"
+
+    (( repo_rc == 0 )) || die "Repository setup failed. Review $LOG_FILE."
+
+    # System update gauge. DNF performs the update as one transaction, so the
+    # gauge reports the current phase rather than inventing a package count.
+    pipe=$(mktemp -u)
+    mkfifo "$pipe"
+
+    dialog --title "System Update" \
+        --gauge "Preparing the system update..." 10 72 0 <"$pipe" &
+    gauge_pid=$!
+
+    (
+        exec 3>"$pipe"
+        printf '5\nXXX\nRefreshing repository metadata...\nXXX\n' >&3
+        dnf -q makecache >>"$LOG_FILE" 2>&1 || true
+
+        printf '20\nXXX\nResolving and installing available updates...\nXXX\n' >&3
+
+        dnf -y upgrade >>"$LOG_FILE" 2>&1 &
+        local dnf_pid=$!
+        local progress=20
+
+        while kill -0 "$dnf_pid" 2>/dev/null; do
+            progress=$((progress + 3))
+            (( progress > 92 )) && progress=35
+            printf '%s\nXXX\nSystem update is running... Details: %s\nXXX\n' \
+                "$progress" "$LOG_FILE" >&3
+            sleep 1
+        done
+
+        wait "$dnf_pid"
+        local update_rc=$?
+
+        if (( update_rc != 0 )); then
+            printf '100\nXXX\nSystem update failed. See %s\nXXX\n' "$LOG_FILE" >&3
+            exit "$update_rc"
+        fi
+
+        printf '100\nXXX\nSystem update completed successfully.\nXXX\n' >&3
+        exec 3>&-
+    )
+    local update_rc=$?
+
+    wait "$gauge_pid" 2>/dev/null || true
+    rm -f "$pipe"
+
+    (( update_rc == 0 )) || die "System update failed. Review $LOG_FILE."
+
+    # Required package installation gauge. Each package is installed
+    # individually so the displayed percentage and package name are real.
+    total=${#packages[@]}
+    count=0
+
+    pipe=$(mktemp -u)
+    mkfifo "$pipe"
+
+    dialog --title "Installing Required Packages" \
+        --gauge "Preparing package installation..." 10 76 0 <"$pipe" &
+    gauge_pid=$!
+
+    exec 3>"$pipe"
+
+    for package in "${packages[@]}"; do
+        count=$((count + 1))
+        percent=$((count * 100 / total))
+
+        printf '%s\nXXX\nInstalling %s (%d of %d)...\nXXX\n' \
+            "$percent" "$package" "$count" "$total" >&3
+
+        if ! dnf -y install "$package" >>"$LOG_FILE" 2>&1; then
+            exec 3>&-
+            wait "$gauge_pid" 2>/dev/null || true
+            rm -f "$pipe"
+            die "Package installation failed for '$package'. Review $LOG_FILE."
+        fi
+    done
+
+    printf '100\nXXX\nAll required packages installed successfully.\nXXX\n' >&3
+    exec 3>&-
+
+    wait "$gauge_pid" 2>/dev/null || true
+    rm -f "$pipe"
+
+    dialog --title "Package Installation Complete" --msgbox \
+        "All required KVM and Cockpit packages installed successfully.\n\nDetailed log:\n$LOG_FILE" \
+        9 70
 }
 
 configure_ntp() {
