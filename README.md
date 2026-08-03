@@ -1,6 +1,6 @@
 # KVM & VLAN Setup Installer for Rocky Linux
 
-This project provides a comprehensive, dialog-based Bash installer that automates the setup of a **Rocky Linux 9.x server** as a secure, VLAN-aware KVM virtualization host.
+This project provides a comprehensive, dialog-based Bash installer that automates the setup of a **Rocky Linux 10.x server** as a secure, VLAN-aware KVM virtualization host.
 
 ---
 
