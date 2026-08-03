@@ -295,87 +295,60 @@ install_packages() {
         )
     )
 
-    # System update: run dnf's upgrade as a single background transaction,
-    # then tail dnf's own output so the gauge shows the real package name
-    # and a real X/Y count as dnf reports them, instead of a fabricated
-    # phase message. A single transaction also avoids the ambiguity and
-    # repeated dependency resolution of updating packages one at a time.
-    local update_pipe update_gauge_pid update_rc dnf_pid line progress_log
-    local pkg_action pkg_name pkg_count pkg_total percent dnf_rc
+    # System update: tailing dnf's own transcript for a single combined
+    # "dnf -y upgrade" transaction (the previous approach) ties the gauge to
+    # dnf/rpm's own stdout timing, which can lag or batch for reasons
+    # entirely outside our control - the gauge label ends up several
+    # packages behind reality, looks "frozen," then catches up all at once.
+    # Confirmed on this hardware with two different packages landing at the
+    # same ~52% mark, which rules out a single slow package and points at
+    # the tailing approach itself.
+    #
+    # Instead, use the same pattern proven working in fumatchu/RADS_WEB:
+    # precompute the exact list of packages that need upgrading with
+    # `dnf repoquery --upgrades`, then upgrade them one at a time, printing
+    # the gauge line for each package BEFORE calling dnf on it. The
+    # displayed package/percentage is then always in lockstep with what is
+    # about to run, not dependent on dnf's own output reappearing in time.
+    local update_pipe update_gauge_pid pkg upd_count upd_total upd_pct
+    local -a UPDATE_LIST
 
-    update_pipe=$(mktemp -u)
-    mkfifo "$update_pipe"
+    printf 'Checking for available updates...\n' | tee -a "$LOG_FILE" >/dev/null
+    dnf -q makecache >>"$LOG_FILE" 2>&1 || true
 
-    dialog --title "System Update" \
-        --gauge "Preparing the system update..." 10 74 0 <"$update_pipe" &
-    update_gauge_pid=$!
+    # fwupd/fwupd-efi are excluded: a KVM hypervisor host has no real need
+    # for firmware-update tooling, and it removes any chance of its
+    # UEFI-NVRAM-touching scriptlet adding a genuinely long single-package
+    # step to this list.
+    mapfile -t UPDATE_LIST < <(dnf -q repoquery --upgrades --qf '%{name}' 2>/dev/null | grep -v '^fwupd' | sort -u)
+    upd_total=${#UPDATE_LIST[@]}
 
-    if (
-        exec 3>"$update_pipe"
-        printf '0\nXXX\nRefreshing repository metadata...\nXXX\n' >&3
-        dnf -q makecache >>"$LOG_FILE" 2>&1 || true
-
-        printf '1\nXXX\nResolving the update transaction...\nXXX\n' >&3
-
-        progress_log=$(mktemp)
-        : >"$progress_log"
-
-        # dnf is a Python program: when its stdout isn't a real terminal
-        # (as here, redirected into progress_log), Python fully buffers
-        # stdout in ~8KB chunks instead of flushing per line. Without this,
-        # every "Upgrading: pkg N/Total" line sits in that buffer and only
-        # appears all at once when it fills or dnf exits - which looks like
-        # the gauge freezing, then "instantly" finishing all 100+ packages.
-        # PYTHONUNBUFFERED forces Python to flush stdout after every write.
-        # fwupd-efi is excluded: its post-install scriptlet touches UEFI
-        # NVRAM, and slow/buggy EFI variable writes on real hardware are a
-        # known cause of a multi-minute stall mid-transaction (confirmed on
-        # this hardware: the gauge froze at the exact same package,
-        # "fwupd-efi ... 70 of 133", on two separate runs). A KVM hypervisor
-        # host has no real need for firmware-update tooling, so skip it
-        # rather than chase a firmware quirk on this specific board.
-        PYTHONUNBUFFERED=1 dnf -y upgrade --exclude='fwupd*' >"$progress_log" 2>&1 &
-        dnf_pid=$!
-
-        tail -n0 -F "$progress_log" --pid="$dnf_pid" 2>/dev/null | while IFS= read -r line; do
-            if [[ "$line" =~ ^[[:space:]]*(Upgrading|Installing|Reinstalling|Downgrading|Removing|Erasing|Obsoleting)[[:space:]]*:[[:space:]]+(.+[^[:space:]])[[:space:]]+([0-9]+)/([0-9]+)[[:space:]]*$ ]]; then
-                pkg_action="${BASH_REMATCH[1]}"
-                pkg_name="${BASH_REMATCH[2]}"
-                pkg_count="${BASH_REMATCH[3]}"
-                pkg_total="${BASH_REMATCH[4]}"
-                percent=$(( pkg_count * 100 / pkg_total ))
-                # Timestamp every package transition into the real log (not
-                # just the progress_log dump at the end) so any future stall
-                # is immediately visible as a wall-clock gap between lines,
-                # instead of having to reproduce it to find out where time went.
-                log "dnf: $pkg_action $pkg_name ($pkg_count/$pkg_total)"
-                printf '%s\nXXX\n%s: %s (%s of %s)\nXXX\n' \
-                    "$percent" "$pkg_action" "$pkg_name" "$pkg_count" "$pkg_total" >&3
-            fi
-        done || true
-
-        wait "$dnf_pid"
-        dnf_rc=$?
-
-        cat "$progress_log" >>"$LOG_FILE"
-        rm -f "$progress_log"
-
-        if (( dnf_rc == 0 )); then
-            printf '100\nXXX\nSystem update complete.\nXXX\n' >&3
-        else
-            printf '100\nXXX\nSystem update failed. See log for details.\nXXX\n' >&3
-        fi
-        exit "$dnf_rc"
-    ); then
-        update_rc=0
+    if (( upd_total == 0 )); then
+        log "No packages require updating."
     else
-        update_rc=$?
+        update_pipe=$(mktemp -u)
+        mkfifo "$update_pipe"
+
+        dialog --title "System Update" \
+            --gauge "Starting system update..." 10 74 0 <"$update_pipe" &
+        update_gauge_pid=$!
+
+        exec 3>"$update_pipe"
+        upd_count=0
+        for pkg in "${UPDATE_LIST[@]}"; do
+            upd_count=$((upd_count + 1))
+            upd_pct=$(( upd_count * 100 / upd_total ))
+            printf '%s\nXXX\nUpgrading: %s (%s of %s)\nXXX\n' \
+                "$upd_pct" "$pkg" "$upd_count" "$upd_total" >&3
+            log "dnf: Upgrading $pkg ($upd_count/$upd_total)"
+            dnf -y -q upgrade --best --allowerasing "$pkg" >>"$LOG_FILE" 2>&1 || true
+        done
+        printf '100\nXXX\nSystem update complete.\nXXX\n' >&3
+        exec 3>&-
+
+        wait "$update_gauge_pid" 2>/dev/null || true
+        rm -f "$update_pipe"
     fi
-
-    wait "$update_gauge_pid" 2>/dev/null || true
-    rm -f "$update_pipe"
-
-    (( update_rc == 0 )) || die "System update failed. Review $LOG_FILE."
 
     dialog --title "Package Installation" --infobox \
         "Installing Required Packages..." 5 50
@@ -802,6 +775,18 @@ may be removed manually.
 EOF
 
     log "/home reclaim completed. Backup retained at $backup."
+
+    dialog --title "Home Reclaim Successful" --msgbox \
+"/home was successfully merged into the root filesystem.
+
+  Removed LV:   $home_lv
+  Extended LV:  $root_lv
+  Backup:       $backup
+  Fstab backup: $fstab_backup
+
+/home is now a regular directory on root with your data restored.
+The backup above is kept until you confirm everything looks right
+after a reboot; it is not deleted automatically." 16 78
 }
 
 profile_exists() {
