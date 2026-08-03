@@ -704,7 +704,19 @@ Continue?" 20 78 || return 0
     done
     (( umount_ok )) || log "umount /home did not succeed after $umount_attempt attempts."
 
-    if findmnt --target /home >/dev/null 2>&1; then
+    # NOTE: this deliberately uses `mountpoint -q /home`, not
+    # `findmnt --target /home`. findmnt --target resolves a path to
+    # whatever filesystem currently backs it - once /home is successfully
+    # unmounted it's just an empty directory on root, and findmnt happily
+    # matches root and reports "mounted" anyway. That false positive was
+    # the actual cause of every "still busy" failure seen so far: dmesg
+    # confirmed XFS completed the unmount (its "Unmounting Filesystem" log
+    # line only appears once the kernel has fully torn the mount down), and
+    # there was exactly one umount attempt logged with no retries, meaning
+    # it succeeded on the first try - the very next check just asked the
+    # wrong question. mountpoint -q tests specifically "is this path its
+    # own separate mount point right now," which is what we actually want.
+    if mountpoint -q /home; then
         # Capture what's actually holding /home open right now, since
         # whatever is busy may clear up by the time anyone looks manually.
         # Every line here is individually guarded so a missing tool can
